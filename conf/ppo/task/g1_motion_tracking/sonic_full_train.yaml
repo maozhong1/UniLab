@@ -1,0 +1,71 @@
+# @package _global_
+#
+# SONIC V2 finetune task: G1SonicMotionTracking env (task-3 obs: multi-future
+# command + proprio history, pelvis anchor) + sonic G1 encoder(+FSQ)+decoder actor
+# (task-2) + stock MLP critic. Run:
+#   HF_ENDPOINT=https://hf-mirror.com uv run --no-sync train \
+#     --algo ppo --task g1_motion_tracking --sim mujoco training.device=xpu \
+#     task=g1_motion_tracking/sonic env.motion_file=<bones_seed.npz>
+#
+# The env emits a single 1570-dim actor stream ``obs`` = enc(640) ++ proprio(930);
+# SonicG1ActorModel splits it internally (proprio_group=null). Critic = stock 286.
+training:
+  task_name: G1SonicMotionTracking
+  sim_backend: mujoco
+  play_steps: 1000
+algo:
+  num_envs: 1024
+  max_iterations: 15000
+  save_interval: 500
+  obs_groups:
+    actor:
+      - actor        # the 1570-dim env "obs" stream (mapped to tensordict key "actor")
+    critic:
+      - critic       # stock 286-dim BeyondMimic critic
+  actor:
+    class_name: unilab.algos.torch.sonic:SonicG1ActorModel
+    enc_group: actor         # single combined stream ...
+    proprio_group: null      # ... split internally into enc(640) + proprio(930)
+    enc_dim: 640
+    proprio_dim: 930
+    use_fsq: true            # task-5 no-FSQ baseline: set false
+    with_kin_aux: false      # set true + fork PPO for sonic g1_recon aux loss
+    freeze_encoder: false    # true to keep FSQ token space fixed (VLA-compat red line)
+    obs_normalization: false # sonic encoder trained on raw obs; keep off for finetune
+    pretrained_ckpt: null    # set to sonic_release/last.pt to warm-start G1 weights
+    distribution_cfg:
+      class_name: GaussianDistribution
+      init_std: 1.0          # 0.05 to mirror sonic's trained std (small exploration)
+      std_type: scalar
+  critic:
+    class_name: rsl_rl.models.MLPModel
+    hidden_dims: [512, 256, 128]
+    activation: elu
+    obs_normalization: true
+  algorithm:
+    entropy_coef: 0.005
+env:
+reward:
+  scales:
+    motion_global_root_pos: 0.5
+    motion_global_root_ori: 0.5
+    motion_body_pos: 1.0
+    motion_body_ori: 1.0
+    motion_body_lin_vel: 1.0
+    motion_body_ang_vel: 1.0
+    motion_joint_pos: 0.0
+    motion_joint_vel: 0.0
+    action_rate_l2: -0.1
+    joint_limit: -10.0
+  std_root_pos: 0.3
+  std_root_ori: 0.4
+  std_body_pos: 0.3
+  std_body_ori: 0.4
+  std_body_lin_vel: 1.0
+  std_body_ang_vel: 3.14
+  std_joint_pos: 0.2
+  std_joint_vel: 1.0
+play_profile:
+  enabled: true
+  env:
+    render_spacing: 2.0

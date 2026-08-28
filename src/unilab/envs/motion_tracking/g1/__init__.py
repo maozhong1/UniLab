@@ -50,6 +50,7 @@ from .tracking_sac import (
     G1MotionTrackingSACCfg,
     G1MotionTrackingSACEnv,
 )
+from .tracking_sonic import G1SonicMotionTrackingCfg, G1SonicMotionTrackingEnv
 
 __all__ = [
     "G1MotionTracking23DofCfg",
@@ -67,6 +68,8 @@ __all__ = [
     "G1WBTObs23DofCfg",
     "G1WBTObsCfg",
     "G1WBTObsEnv",
+    "G1SonicMotionTrackingCfg",
+    "G1SonicMotionTrackingEnv",
     "G1FlipTracking23DofCfg",
     "G1FlipTracking23DofEnvCfg",
     "G1FlipTrackingCfg",
