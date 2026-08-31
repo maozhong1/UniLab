@@ -36,12 +36,9 @@ algo:
     freeze_encoder: false
     obs_normalization: false # sonic encoder trained on raw obs; keep off for finetune
     # WARM-START from sonic_release/last.pt (byte-compat verified via parity_harness).
-    # Default ./last.pt = a checkpoint dropped at the repo root (git-ignored, fetch it
-    # separately). Path is resolved from the training launch dir; if Hydra job.chdir is
-    # enabled, pass an absolute path instead: algo.actor.pretrained_ckpt=/abs/last.pt.
     # Revert to from-scratch on the CLI: algo.actor.pretrained_ckpt=null
     #   algo.actor.distribution_cfg.init_std=1.0 +env.action_output_isaaclab_to_mujoco=false
-    pretrained_ckpt: ./last.pt
+    pretrained_ckpt: /home/maozhong/work/sonic_vla_infer/GR00T-WholeBodyControl-ov/sonic_release/last.pt
     distribution_cfg:
       class_name: GaussianDistribution
       init_std: 0.05         # mirror sonic's trained std (small exploration for warm-start)

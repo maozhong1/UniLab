@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any, cast
 
@@ -8,6 +9,8 @@ from rsl_rl.algorithms import PPO
 from tensordict import TensorDict
 
 from unilab.algos.torch.common.compile import get_torch_compile_for_cuda
+
+logger = logging.getLogger(__name__)
 
 _LOG_2_PI = math.log(2.0 * math.pi)
 _NORMAL_ENTROPY_OFFSET = 0.5 * (1.0 + _LOG_2_PI)
@@ -22,6 +25,8 @@ class FinalObservationAwarePPO(PPO):
         self,
         *args: Any,
         enable_compile: bool = False,
+        encoder_lr: float | None = None,
+        critic_lr: float | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -31,6 +36,94 @@ class FinalObservationAwarePPO(PPO):
         self._minibatch_loss_fn = self._minibatch_loss_tensors
         if self.enable_compile:
             self._compile_training_methods()
+        self._setup_lr_groups(encoder_lr, critic_lr)
+
+    def _setup_lr_groups(self, encoder_lr: float | None, critic_lr: float | None) -> None:
+        """Give the encoder and/or the critic their own (absolute) LR param groups.
+
+        No-op when both are None -> the base single param group is kept and encoder,
+        decoder and critic all share ``learning_rate`` (default behaviour).
+
+        When either is set, the optimizer is split into up to three groups — encoder,
+        critic, and "rest" (decoder + actor std) — each tagged with an ``lr_scale`` =
+        group_lr / base_lr. ``base_lr`` (= ``learning_rate``) is the actor/decoder LR.
+        This replicates official sonic's fixed separate actor/critic LRs (actor 2e-5,
+        critic 1e-3), the standard cure for cold-critic warm-start collapse: the fresh
+        critic learns fast while the warm actor barely moves.
+
+        The adaptive-KL scheduler flattens every param group to a single scalar LR each
+        minibatch, which would erase the split, so we pin ``schedule='fixed'`` whenever a
+        custom group is created. Frozen / non-trainable params are filtered out.
+        """
+        if encoder_lr is None and critic_lr is None:
+            return
+
+        base_lr = float(self.learning_rate)
+        # Build the special (non-base) groups first, tracking claimed params so a param
+        # is never placed in two groups (e.g. if critic and encoder overlapped).
+        special: list[tuple[str, list, float]] = []
+        claimed_ids: set[int] = set()
+
+        if critic_lr is not None:
+            crit_params = [p for p in self.critic.parameters() if p.requires_grad]
+            if crit_params:
+                special.append(("critic", crit_params, float(critic_lr)))
+                claimed_ids |= {id(p) for p in crit_params}
+            else:
+                logger.info("[critic_lr] critic has no trainable params; ignoring critic_lr")
+
+        if encoder_lr is not None:
+            encoder = getattr(getattr(self.actor, "core", None), "encoder", None)
+            if encoder is None:
+                logger.warning("[encoder_lr] actor has no .core.encoder; ignoring encoder_lr")
+            else:
+                enc_params = [
+                    p
+                    for p in encoder.parameters()
+                    if p.requires_grad and id(p) not in claimed_ids
+                ]
+                if enc_params:
+                    special.append(("encoder", enc_params, float(encoder_lr)))
+                    claimed_ids |= {id(p) for p in enc_params}
+                else:
+                    logger.info(
+                        "[encoder_lr] encoder has no trainable params (frozen); ignoring encoder_lr"
+                    )
+
+        if not special:
+            return
+
+        # "rest" = everything currently in the optimizer not claimed by a special group.
+        rest_params = [
+            p
+            for group in self.optimizer.param_groups
+            for p in group["params"]
+            if id(p) not in claimed_ids
+        ]
+        # Carry over non-lr optimizer hyperparameters (betas, eps, weight_decay, ...).
+        template = {
+            k: v
+            for k, v in self.optimizer.param_groups[0].items()
+            if k not in ("params", "lr", "initial_lr", "lr_scale")
+        }
+        groups = [
+            {"params": params, "lr": lr, "lr_scale": lr / base_lr, **template}
+            for _, params, lr in special
+        ]
+        groups.append({"params": rest_params, "lr": base_lr, "lr_scale": 1.0, **template})
+        opt_cls = type(self.optimizer)
+        self.optimizer = opt_cls(groups)
+
+        if self.schedule == "adaptive":
+            logger.warning(
+                "[lr_groups] pinning schedule='fixed' (was 'adaptive') so per-group LRs "
+                "stay separate; the base (decoder/actor) LR will no longer KL-adapt."
+            )
+            self.schedule = "fixed"
+        desc = ", ".join(f"{n} lr={lr:g}(scale={lr / base_lr:.3g})" for n, _, lr in special)
+        logger.info(
+            f"[lr_groups] split optimizer -> {desc}, rest(decoder/actor) lr={base_lr:g}"
+        )
 
     def _compile_training_methods(self) -> None:
         compile_fn = get_torch_compile_for_cuda(self.device, warn=True)
@@ -197,7 +290,7 @@ class FinalObservationAwarePPO(PPO):
 
                 self.learning_rate = learning_rate
                 for param_group in self.optimizer.param_groups:
-                    param_group["lr"] = learning_rate
+                    param_group["lr"] = learning_rate * param_group.get("lr_scale", 1.0)
 
             self.optimizer.zero_grad()
             loss.backward()

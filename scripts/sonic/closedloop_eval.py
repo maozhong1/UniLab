@@ -17,7 +17,8 @@ PD targets to the reference and never exercises the policy's balance.
 
 Run:
     HF_ENDPOINT=https://hf-mirror.com uv run --no-sync python scripts/sonic/closedloop_eval.py \
-        --ckpt ./last.pt --num-envs 8 --steps 500
+        --ckpt /home/maozhong/work/sonic_vla_infer/GR00T-WholeBodyControl-ov/sonic_release/last.pt \
+        --num-envs 8 --steps 500
     # optionally track the same clips the finetune used:
     #   --motion_file /home/maozhong/work/sonic_vla_infer/bones_seed_subset/npz/<clip>.npz
 """
@@ -41,9 +42,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--ckpt",
-        # Relative to the launch dir (repo root under `uv run python scripts/...`).
-        default="./last.pt",
-        help="sonic last.pt (the warm init) to evaluate closed-loop; default ./last.pt.",
+        default="/home/maozhong/work/sonic_vla_infer/GR00T-WholeBodyControl-ov/sonic_release/last.pt",
+        help="sonic last.pt (the warm init) to evaluate closed-loop.",
     )
     ap.add_argument("--task", default="G1SonicMotionTracking")
     ap.add_argument("--sim", default="mujoco")

@@ -26,8 +26,8 @@ observation is consumed correctly end-to-end.
 Run:
     HF_ENDPOINT=https://hf-mirror.com \
     uv run --no-sync python scripts/sonic/parity_harness.py \
-        --ckpt ./last.pt \
-        --onnx-dir /path/to/gear_sonic_deploy/policy/release
+        --ckpt /home/maozhong/work/sonic_vla_infer/GR00T-WholeBodyControl-ov/sonic_release/last.pt \
+        --onnx-dir /home/maozhong/work/sonic_vla_infer/GR00T-WholeBodyControl-ov/gear_sonic_deploy/policy/release
 """
 from __future__ import annotations
 
@@ -215,12 +215,9 @@ def check_env(model: SonicG1Core, enc_sess, dec_sess) -> bool:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    # --ckpt defaults to ./last.pt (repo root under `uv run python scripts/...`).
-    # --onnx-dir is the deployed reference ONNX dir (external gear_sonic_deploy release);
-    # it has no in-repo default, so pass it explicitly when running the parity check.
-    default_root = "/path/to/gear_sonic_deploy/policy/release"
-    ap.add_argument("--ckpt", default="./last.pt")
-    ap.add_argument("--onnx-dir", default=default_root)
+    default_root = "/home/maozhong/work/sonic_vla_infer/GR00T-WholeBodyControl-ov"
+    ap.add_argument("--ckpt", default=f"{default_root}/sonic_release/last.pt")
+    ap.add_argument("--onnx-dir", default=f"{default_root}/gear_sonic_deploy/policy/release")
     ap.add_argument("--env", action="store_true", help="also run the real env obs check")
     args = ap.parse_args()
 

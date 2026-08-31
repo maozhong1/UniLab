@@ -21,6 +21,10 @@ CKPT="${CKPT:-./last.pt}"
 DEVICE="${DEVICE:-xpu}"
 FREEZE_ENCODER="${FREEZE_ENCODER:-false}"   # true = decoder-only (VLA-safe token space)
 LR="${LR:-0.0001}"                          # PPO learning rate (lower for gentler warm-start finetune)
+ENCODER_LR="${ENCODER_LR:-}"                 # optional absolute encoder LR; when set (and encoder NOT frozen),
+                                            # encoder uses this LR while decoder/critic use LR. Unset -> encoder uses LR.
+CRITIC_LR="${CRITIC_LR:-}"                   # optional absolute critic LR (cold-critic cure). When set, critic uses
+                                            # this LR while actor(decoder/encoder) uses LR. Official: LR=2e-5 CRITIC_LR=1e-3.
 
 if [[ "$MODE" == "smoke" ]]; then
   NUM_ENVS="${NUM_ENVS:-16}"; ITERS="${ITERS:-2}"; SAVE="${SAVE:-1000}"
@@ -41,7 +45,18 @@ fi
 LIST=$(ls "$NPZ_DIR"/*.npz 2>/dev/null | paste -sd, -)
 [[ -n "$LIST" ]] || { echo "[train_warm] no .npz in $NPZ_DIR" >&2; exit 1; }
 
-echo "[train_warm] mode=$MODE device=$DEVICE envs=$NUM_ENVS iters=$ITERS save=$SAVE lr=$LR freeze_encoder=$FREEZE_ENCODER"
+# Optional per-group LRs. Encoder LR only meaningful when the encoder is trainable;
+# critic LR always applies (critic is always trained).
+ENC_LR_ARG=""
+if [[ "$FREEZE_ENCODER" != "true" && -n "$ENCODER_LR" ]]; then
+  ENC_LR_ARG="algo.algorithm.encoder_lr=$ENCODER_LR"
+fi
+CRIT_LR_ARG=""
+if [[ -n "$CRITIC_LR" ]]; then
+  CRIT_LR_ARG="algo.algorithm.critic_lr=$CRITIC_LR"
+fi
+
+echo "[train_warm] mode=$MODE device=$DEVICE envs=$NUM_ENVS iters=$ITERS save=$SAVE lr=$LR encoder_lr=${ENCODER_LR:-<=lr>} critic_lr=${CRITIC_LR:-<=lr>} freeze_encoder=$FREEZE_ENCODER"
 echo "[train_warm] ckpt=$CKPT"
 echo "[train_warm] motions=$(echo "$LIST" | tr ',' '\n' | wc -l) clips from $NPZ_DIR"
 
@@ -51,6 +66,8 @@ HF_ENDPOINT=https://hf-mirror.com uv run --no-sync python scripts/train_rsl_rl.p
   algo.actor.freeze_encoder="$FREEZE_ENCODER" \
   algo.actor.distribution_cfg.init_std=0.05 \
   algo.algorithm.learning_rate="$LR" \
+  $ENC_LR_ARG \
+  $CRIT_LR_ARG \
   algo.algorithm.entropy_coef=0.001 \
   "+env.motion_file=[$LIST]" \
   algo.num_envs="$NUM_ENVS" algo.max_iterations="$ITERS" algo.save_interval="$SAVE"

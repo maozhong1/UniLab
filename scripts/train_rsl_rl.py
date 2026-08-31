@@ -295,7 +295,21 @@ def play_rsl_rl(cfg: DictConfig, device: str) -> str | None:
         env_action_dim=getattr(wrapped_env, "num_actions", None),
         algo_name="ppo",
     ):
-        runner.load(str(load_path), map_location=device)
+        # Play/verify needs only the policy weights, not the optimizer. Skipping the
+        # optimizer also decouples play from the training-time optimizer structure: a
+        # checkpoint trained with split param groups (encoder_lr / critic_lr) would
+        # otherwise fail optimizer.load_state_dict on a group-count mismatch here.
+        runner.load(
+            str(load_path),
+            load_cfg={
+                "actor": True,
+                "critic": True,
+                "optimizer": False,
+                "iteration": True,
+                "rnd": False,
+            },
+            map_location=device,
+        )
     policy = runner.get_inference_policy(device=device)
     if EXPORT_POLICY:
         runner.export_policy_to_onnx(path=str(load_path_dir))
@@ -609,5 +623,8 @@ def main(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
-    EXPORT_POLICY = True
+    # Generic rsl_rl JIT/ONNX export cannot torch.jit.script the sonic core
+    # (NUM_TOKENS etc. are not script-visible); use scripts/sonic/export_deploy_onnx.py
+    # for sonic deploy graphs. Set EXPORT_POLICY=0 to skip export (e.g. for play/verify).
+    EXPORT_POLICY = os.environ.get("EXPORT_POLICY", "1") != "0"
     main()

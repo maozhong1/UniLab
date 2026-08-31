@@ -246,6 +246,12 @@ class PPOAlgorithmConfig:
     num_learning_epochs: int = 5
     num_mini_batches: int = 4
     learning_rate: float = 1e-3
+    # Optional absolute LRs for separate param groups. None -> that module shares
+    # ``learning_rate`` (single param group, default). When either is set, the optimizer
+    # is split (encoder / critic / rest) and ``schedule`` is pinned to "fixed".
+    # Official sonic cold-critic cure: learning_rate=2e-5 (actor) + critic_lr=1e-3.
+    encoder_lr: Optional[float] = None
+    critic_lr: Optional[float] = None
     schedule: str = "adaptive"
     gamma: float = 0.99
     lam: float = 0.95
