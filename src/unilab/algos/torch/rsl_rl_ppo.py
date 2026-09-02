@@ -27,6 +27,7 @@ class FinalObservationAwarePPO(PPO):
         enable_compile: bool = False,
         encoder_lr: float | None = None,
         critic_lr: float | None = None,
+        critic_warmup_iters: int = 0,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -37,6 +38,59 @@ class FinalObservationAwarePPO(PPO):
         if self.enable_compile:
             self._compile_training_methods()
         self._setup_lr_groups(encoder_lr, critic_lr)
+        self._setup_critic_warmup(critic_warmup_iters)
+
+    def _setup_critic_warmup(self, critic_warmup_iters: int) -> None:
+        """Freeze the actor for the first ``critic_warmup_iters`` iterations.
+
+        Root-cause cure for cold-critic warm-start collapse: when a warm (expert) actor
+        is paired with a FRESH critic, the critic's early value estimates are garbage, so
+        the first PPO advantages are noise that push the expert actor off its good init;
+        by the time the critic catches up the actor is already corrupted and the pair
+        locks into a low-reward equilibrium. Freezing the actor (encoder + decoder + std)
+        for N iters lets the critic burn in on the warm policy's returns FIRST; the actor
+        is then unfrozen and updated with advantages from an already-accurate critic.
+
+        Implementation: flip ``requires_grad=False`` on every currently-trainable actor
+        tensor (so params already frozen by ``freeze_encoder`` stay frozen and are NOT
+        restored later). The critic keeps training normally. Intended to be used together
+        with ``critic_lr`` (split optimizer, schedule pinned 'fixed'); with an adaptive
+        schedule the near-zero KL during warmup would spuriously nudge the LR.
+        """
+        self._critic_warmup_iters = int(critic_warmup_iters or 0)
+        self._iter_count = 0
+        self._warmup_active = False
+        self._warmup_frozen_params: list[torch.nn.Parameter] = []
+        if self._critic_warmup_iters <= 0:
+            return
+        self._warmup_frozen_params = [p for p in self.actor.parameters() if p.requires_grad]
+        for p in self._warmup_frozen_params:
+            p.requires_grad_(False)
+        self._warmup_active = True
+        if self.schedule == "adaptive":
+            logger.warning(
+                "[critic_warmup] schedule is 'adaptive'; recommend setting critic_lr so the "
+                "schedule is pinned 'fixed' (near-zero KL while the actor is frozen would "
+                "otherwise perturb the LR)."
+            )
+        logger.info(
+            f"[critic_warmup] freezing actor for the first {self._critic_warmup_iters} iters "
+            f"(cold-critic burn-in); {len(self._warmup_frozen_params)} actor tensors frozen, "
+            f"only the critic learns until then."
+        )
+
+    def _maybe_end_critic_warmup(self) -> None:
+        """Unfreeze the actor once the burn-in window has elapsed (called each update)."""
+        if not self._warmup_active or self._iter_count < self._critic_warmup_iters:
+            return
+        for p in self._warmup_frozen_params:
+            p.requires_grad_(True)
+        self._warmup_active = False
+        self._warmup_frozen_params = []
+        logger.info(
+            f"[critic_warmup] done after {self._critic_warmup_iters} iters -> actor unfrozen; "
+            f"resuming normal actor+critic PPO updates."
+        )
 
     def _setup_lr_groups(self, encoder_lr: float | None, critic_lr: float | None) -> None:
         """Give the encoder and/or the critic their own (absolute) LR param groups.
@@ -239,6 +293,15 @@ class FinalObservationAwarePPO(PPO):
         return loss, surrogate_loss, value_loss, entropy, kl_mean
 
     def update(self) -> dict[str, float]:
+        # Unfreeze the actor once the critic burn-in window elapses (no-op otherwise),
+        # then advance the per-iteration counter regardless of which update path runs.
+        self._maybe_end_critic_warmup()
+        try:
+            return self._update_inner()
+        finally:
+            self._iter_count += 1
+
+    def _update_inner(self) -> dict[str, float]:
         if not self._supports_compiled_update_path():
             return cast(dict[str, float], super().update())
 

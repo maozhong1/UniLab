@@ -159,10 +159,12 @@ class G1SonicMotionTrackingCfg(MotionTrackingCfg):
     )
     reward_config: SonicRewardConfig = field(default_factory=SonicRewardConfig)
     # The base termination applies this permissive bound. The subclass below adds
-    # SONIC's strict 0.15 m threshold except during low-reference motions.
+    # SONIC's strict tracking-error threshold except during low-reference motions.
+    # Loosened 0.15 -> 0.30 m: at 0.15 the warm-start last.pt gets early-terminated on
+    # dynamic clips (run/dance) despite staying upright (see closedloop_eval_bybehavior).
     anchor_pos_z_threshold: float = 0.75
     ee_body_pos_z_threshold: float = 0.75
-    strict_height_threshold: float = 0.15
+    strict_height_threshold: float = 0.30
     low_reference_height: float = 0.5
     low_reference_height_threshold: float = 0.75
     # Full pelvis orientation squared-angle threshold and ankle world-position limit.

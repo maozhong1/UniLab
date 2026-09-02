@@ -38,6 +38,7 @@ algo:
     learning_rate: 1.0e-3
     encoder_lr: null   # set to an absolute LR to give the encoder its own (lower) LR; pins schedule=fixed
     critic_lr: null    # set to an absolute LR to give the critic its own (higher) LR (cold-critic cure); pins schedule=fixed
+    critic_warmup_iters: 0   # freeze actor for first N iters so the fresh critic burns in first (cold-critic root-cure); use with critic_lr
     schedule: adaptive
     gamma: 0.99
     lam: 0.95

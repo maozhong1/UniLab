@@ -252,6 +252,10 @@ class PPOAlgorithmConfig:
     # Official sonic cold-critic cure: learning_rate=2e-5 (actor) + critic_lr=1e-3.
     encoder_lr: Optional[float] = None
     critic_lr: Optional[float] = None
+    # Freeze the actor (encoder+decoder+std) for the first N iterations so the FRESH
+    # critic burns in on the warm policy's returns before any actor update. Root-cause
+    # cure for cold-critic warm-start collapse. 0 = disabled. Use with critic_lr set.
+    critic_warmup_iters: int = 0
     schedule: str = "adaptive"
     gamma: float = 0.99
     lam: float = 0.95

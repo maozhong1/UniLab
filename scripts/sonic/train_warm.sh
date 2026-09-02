@@ -25,6 +25,13 @@ ENCODER_LR="${ENCODER_LR:-}"                 # optional absolute encoder LR; whe
                                             # encoder uses this LR while decoder/critic use LR. Unset -> encoder uses LR.
 CRITIC_LR="${CRITIC_LR:-}"                   # optional absolute critic LR (cold-critic cure). When set, critic uses
                                             # this LR while actor(decoder/encoder) uses LR. Official: LR=2e-5 CRITIC_LR=1e-3.
+CRITIC_WARMUP="${CRITIC_WARMUP:-}"           # optional int: freeze actor for the first N iters so the fresh critic
+                                            # burns in FIRST (root-cure for cold-critic collapse). Use with CRITIC_LR.
+NUM_STEPS_PER_ENV="${NUM_STEPS_PER_ENV:-}"   # optional rollout length override (UniLab default 24; Isaac uses 32).
+SAMPLING_MODE="${SAMPLING_MODE:-}"           # optional motion sampler mode. env default is "adaptive" (samples toward
+                                            # FAILURE frames = a curriculum for from-scratch). For WARM-START finetune use a
+                                            # STATIONARY mode ("clip_start"/"uniform"/"mixed") so the critic can converge and
+                                            # the warm policy isn't force-fed its hardest frames (else it collapses ~iter20).
 
 if [[ "$MODE" == "smoke" ]]; then
   NUM_ENVS="${NUM_ENVS:-16}"; ITERS="${ITERS:-2}"; SAVE="${SAVE:-1000}"
@@ -55,8 +62,21 @@ CRIT_LR_ARG=""
 if [[ -n "$CRITIC_LR" ]]; then
   CRIT_LR_ARG="algo.algorithm.critic_lr=$CRITIC_LR"
 fi
+CRIT_WARMUP_ARG=""
+if [[ -n "$CRITIC_WARMUP" ]]; then
+  CRIT_WARMUP_ARG="algo.algorithm.critic_warmup_iters=$CRITIC_WARMUP"
+fi
+STEPS_ARG=""
+if [[ -n "$NUM_STEPS_PER_ENV" ]]; then
+  STEPS_ARG="algo.num_steps_per_env=$NUM_STEPS_PER_ENV"
+fi
+SAMPLING_ARG=""
+if [[ -n "$SAMPLING_MODE" ]]; then
+  # 'env' is a struct that doesn't pre-declare this key (like motion_file) -> append with '+'.
+  SAMPLING_ARG="+env.sampling_mode=$SAMPLING_MODE"
+fi
 
-echo "[train_warm] mode=$MODE device=$DEVICE envs=$NUM_ENVS iters=$ITERS save=$SAVE lr=$LR encoder_lr=${ENCODER_LR:-<=lr>} critic_lr=${CRITIC_LR:-<=lr>} freeze_encoder=$FREEZE_ENCODER"
+echo "[train_warm] mode=$MODE device=$DEVICE envs=$NUM_ENVS iters=$ITERS save=$SAVE lr=$LR encoder_lr=${ENCODER_LR:-<=lr>} critic_lr=${CRITIC_LR:-<=lr>} critic_warmup=${CRITIC_WARMUP:-0} steps_per_env=${NUM_STEPS_PER_ENV:-<default>} sampling_mode=${SAMPLING_MODE:-<default:adaptive>} freeze_encoder=$FREEZE_ENCODER"
 echo "[train_warm] ckpt=$CKPT"
 echo "[train_warm] motions=$(echo "$LIST" | tr ',' '\n' | wc -l) clips from $NPZ_DIR"
 
@@ -68,6 +88,9 @@ HF_ENDPOINT=https://hf-mirror.com uv run --no-sync python scripts/train_rsl_rl.p
   algo.algorithm.learning_rate="$LR" \
   $ENC_LR_ARG \
   $CRIT_LR_ARG \
+  $CRIT_WARMUP_ARG \
+  $STEPS_ARG \
+  $SAMPLING_ARG \
   algo.algorithm.entropy_coef=0.001 \
   "+env.motion_file=[$LIST]" \
   algo.num_envs="$NUM_ENVS" algo.max_iterations="$ITERS" algo.save_interval="$SAVE"
