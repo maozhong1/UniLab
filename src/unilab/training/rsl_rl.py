@@ -121,8 +121,10 @@ def normalize_ppo_train_cfg(train_cfg: dict[str, Any]) -> dict[str, Any]:
     normalized = deepcopy(train_cfg)
     algorithm_cfg = normalized.get("algorithm")
     if isinstance(algorithm_cfg, dict):
+        # NOTE: target_kl_stop is intentionally NOT stripped — FinalObservationAwarePPO
+        # consumes it as an explicit __init__ kwarg (KL early-stop guardrail); it never
+        # reaches base rsl-rl PPO.__init__, so it is safe to forward.
         for key in (
-            "target_kl_stop",
             "adaptive_kl_beta",
             "adaptive_lr_growth",
             "adaptive_lr_decay",

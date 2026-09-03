@@ -32,6 +32,11 @@ SAMPLING_MODE="${SAMPLING_MODE:-}"           # optional motion sampler mode. env
                                             # FAILURE frames = a curriculum for from-scratch). For WARM-START finetune use a
                                             # STATIONARY mode ("clip_start"/"uniform"/"mixed") so the critic can converge and
                                             # the warm policy isn't force-fed its hardest frames (else it collapses ~iter20).
+TARGET_KL_STOP="${TARGET_KL_STOP:-}"         # optional float: per-iteration KL early-stop guardrail. Once a minibatch's mean
+                                            # KL exceeds this, the update stops applying steps for that iteration -> caps how far
+                                            # the actor can move per iter. WORKS with a fixed/split LR (critic_lr pins schedule
+                                            # 'fixed', which disables the adaptive-KL LR brake), so it stops the slow drift seen
+                                            # on out-of-distribution warm finetunes. Try 0.01-0.02 (=desired_kl .. 2x).
 
 if [[ "$MODE" == "smoke" ]]; then
   NUM_ENVS="${NUM_ENVS:-16}"; ITERS="${ITERS:-2}"; SAVE="${SAVE:-1000}"
@@ -75,8 +80,13 @@ if [[ -n "$SAMPLING_MODE" ]]; then
   # 'env' is a struct that doesn't pre-declare this key (like motion_file) -> append with '+'.
   SAMPLING_ARG="+env.sampling_mode=$SAMPLING_MODE"
 fi
+TARGET_KL_ARG=""
+if [[ -n "$TARGET_KL_STOP" ]]; then
+  # Pre-declared in config.yaml (default null) -> plain override, no '+'.
+  TARGET_KL_ARG="algo.algorithm.target_kl_stop=$TARGET_KL_STOP"
+fi
 
-echo "[train_warm] mode=$MODE device=$DEVICE envs=$NUM_ENVS iters=$ITERS save=$SAVE lr=$LR encoder_lr=${ENCODER_LR:-<=lr>} critic_lr=${CRITIC_LR:-<=lr>} critic_warmup=${CRITIC_WARMUP:-0} steps_per_env=${NUM_STEPS_PER_ENV:-<default>} sampling_mode=${SAMPLING_MODE:-<default:adaptive>} freeze_encoder=$FREEZE_ENCODER"
+echo "[train_warm] mode=$MODE device=$DEVICE envs=$NUM_ENVS iters=$ITERS save=$SAVE lr=$LR encoder_lr=${ENCODER_LR:-<=lr>} critic_lr=${CRITIC_LR:-<=lr>} critic_warmup=${CRITIC_WARMUP:-0} steps_per_env=${NUM_STEPS_PER_ENV:-<default>} sampling_mode=${SAMPLING_MODE:-<default:adaptive>} target_kl_stop=${TARGET_KL_STOP:-<disabled>} freeze_encoder=$FREEZE_ENCODER"
 echo "[train_warm] ckpt=$CKPT"
 echo "[train_warm] motions=$(echo "$LIST" | tr ',' '\n' | wc -l) clips from $NPZ_DIR"
 
@@ -91,6 +101,7 @@ HF_ENDPOINT=https://hf-mirror.com uv run --no-sync python scripts/train_rsl_rl.p
   $CRIT_WARMUP_ARG \
   $STEPS_ARG \
   $SAMPLING_ARG \
+  $TARGET_KL_ARG \
   algo.algorithm.entropy_coef=0.001 \
   "+env.motion_file=[$LIST]" \
   algo.num_envs="$NUM_ENVS" algo.max_iterations="$ITERS" algo.save_interval="$SAVE"
