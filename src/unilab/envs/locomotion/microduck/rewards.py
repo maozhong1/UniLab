@@ -75,29 +75,32 @@ def leg_pose_l2(ctx: RewardContext, weights: np.ndarray) -> np.ndarray:
 # reward functions pure); the gait-phase clock is read from ``ctx.info``.
 
 
-def _feet_phase_targets(gait_phase: np.ndarray, swing_height: float) -> np.ndarray:
-    """Per-foot swing-height target from the gait phase (cubic-bezier profile).
+def _feet_gait_targets(
+    gait_phase: np.ndarray, swing_height: float, duty: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-foot ``(swing-height target, stance-expected mask)`` from a duty-cycle clock.
 
-    Ported verbatim from g1's ``compute_feet_phase_height_targets``: each foot's
-    target rises to ``swing_height`` over the swing half of its phase and returns
-    to 0 over stance. ``gait_phase`` is ``(N, 2)`` in ``[0, 2π)``; returns
-    ``(N, 2)`` height offsets (left, right) above the ground baseline.
+    The original g1 bezier bumped up-and-down EVERY cycle with no planted-stance
+    region, so a fast 5 Hz tap could partially satisfy a 1 Hz clock and never
+    commit to a walk (see docs/microduck_port_plan.md, Run D "fast mincing"). This
+    splits each 2π cycle into a STANCE fraction ``duty`` (foot planted, target
+    height 0) and a SWING fraction ``1-duty`` (a single cubic-bezier lift
+    0→swing_height→0). ``gait_phase`` is ``(N, 2)`` in ``[0, 2π)``; returns
+    ``height (N, 2)`` above the ground baseline and ``stance (N, 2)`` bool
+    (True where the foot is scheduled to be planted).
     """
+    x = np.asarray(gait_phase, dtype=get_global_dtype()) / (2.0 * np.pi)  # [0, 1)
+    stance = x < duty
+    s = np.clip((x - duty) / max(1.0 - duty, 1e-6), 0.0, 1.0)  # swing progress [0,1]
 
-    def cubic_bezier_height(phi: np.ndarray) -> np.ndarray:
-        phi_normalized = np.fmod(phi + np.pi, 2 * np.pi) - np.pi
-        x = (phi_normalized + np.pi) / (2 * np.pi)
+    def bezier(y0: float, y1, t: np.ndarray) -> np.ndarray:
+        return y0 + (y1 - y0) * (t**3 + 3.0 * (t**2 * (1.0 - t)))
 
-        def bezier(y_start: np.ndarray, y_end: np.ndarray, t: np.ndarray) -> np.ndarray:
-            return y_start + (y_end - y_start) * (t**3 + 3 * (t**2 * (1 - t)))
-
-        stance = bezier(np.zeros_like(x), np.full_like(x, swing_height), 2 * x)
-        swing = bezier(np.full_like(x, swing_height), np.zeros_like(x), 2 * x - 1)
-        return np.where(x <= 0.5, stance, swing)
-
-    left = cubic_bezier_height(gait_phase[:, 0])
-    right = cubic_bezier_height(gait_phase[:, 1])
-    return np.column_stack([left, right])
+    up = bezier(0.0, swing_height, 2.0 * s)
+    down = bezier(swing_height, 0.0, 2.0 * s - 1.0)
+    bump = np.where(s <= 0.5, up, down)
+    height = np.where(stance, 0.0, bump)
+    return height.astype(get_global_dtype()), stance
 
 
 def feet_phase(
@@ -107,19 +110,20 @@ def feet_phase(
     ground_z: float,
     sigma: float,
     min_cmd_norm: float,
+    duty: float,
 ) -> np.ndarray:
-    """Exp reward (≥0) for tracking the gait-clock swing-foot height — forces LIFT.
+    """Exp reward (≥0) for tracking the duty-cycle swing-foot height — LIFT in swing,
+    PLANTED (target 0) in stance.
 
-    ``foot_z`` is ``(N, 2)`` world Z of [left, right] foot sites; the swing target
-    is ``ground_z + bezier(gait_phase)``. Gated by the commanded twist magnitude
-    (``norm(commands[:, :3]) > min_cmd_norm``) so idle/zero-command envs aren't
-    forced to step in place — this replaces g1's forward-speed gate to respect
-    microduck's backward + explicit-idle command training.
+    ``foot_z`` is ``(N, 2)`` world Z of [left, right] foot sites; the target is
+    ``ground_z + _feet_gait_targets(...)`` (0 during the scheduled stance, a
+    bezier lift during swing). Gated by the commanded twist magnitude so
+    idle/zero-command envs aren't forced to step in place.
     """
     gait_phase = ctx.info.get(
         "gait_phase", np.zeros((ctx.num_envs, 2), dtype=get_global_dtype())
     )
-    targets = _feet_phase_targets(gait_phase, swing_height)  # (N, 2) heights above ground
+    targets, _ = _feet_gait_targets(gait_phase, swing_height, duty)  # (N, 2) heights
     err = np.sum(np.square((foot_z - ground_z) - targets), axis=1)
     reward = np.exp(-err / sigma)
     cmd = ctx.info["commands"]
@@ -133,6 +137,7 @@ def feet_phase_contrast(
     swing_height: float,
     sigma: float,
     min_cmd_norm: float,
+    duty: float,
 ) -> np.ndarray:
     """Exp reward (≥0) for the L/R foot-HEIGHT DIFFERENCE tracking the gait clock.
 
@@ -145,12 +150,37 @@ def feet_phase_contrast(
     gait_phase = ctx.info.get(
         "gait_phase", np.zeros((ctx.num_envs, 2), dtype=get_global_dtype())
     )
-    targets = _feet_phase_targets(gait_phase, swing_height)
+    targets, _ = _feet_gait_targets(gait_phase, swing_height, duty)
     actual_delta = foot_z[:, 0] - foot_z[:, 1]
     target_delta = targets[:, 0] - targets[:, 1]
     reward = np.exp(-np.square(actual_delta - target_delta) / sigma)
     cmd = ctx.info["commands"]
     moving = np.linalg.norm(cmd[:, :3], axis=1) > min_cmd_norm
+    return np.asarray(reward * moving, dtype=get_global_dtype())
+
+
+def feet_contact_schedule(
+    ctx: RewardContext, contact: np.ndarray, duty: float, min_cmd_norm: float
+) -> np.ndarray:
+    """Dense reward (≥0) — foot CONTACT state matches the duty-cycle clock.
+
+    THE cadence lever. Pays the fraction of feet whose ground-contact agrees with
+    the clock schedule (planted during the ``duty`` stance fraction, airborne
+    during swing). A fast shuffle whose contacts are out of phase with the (slow,
+    1 Hz) clock scores low, so syncing to the clock — i.e. slowing the cadence and
+    holding each stance/swing for its full duration — is the only way to max it.
+    This is the piece missing in Runs A–D: nothing tied CONTACT (hence cadence) to
+    the clock, only instantaneous height. Standing still scores only the stance
+    fraction (mismatched during every swing window), so it's not farmable by not
+    stepping. Command-gated (idle exempt).
+    """
+    gait_phase = ctx.info.get(
+        "gait_phase", np.zeros((ctx.num_envs, 2), dtype=get_global_dtype())
+    )
+    _, stance = _feet_gait_targets(gait_phase, 0.0, duty)  # only the mask matters here
+    match = np.asarray(contact, dtype=bool) == stance  # planted in stance, air in swing
+    reward = np.mean(match.astype(get_global_dtype()), axis=1)
+    moving = np.linalg.norm(ctx.info["commands"][:, :3], axis=1) > min_cmd_norm
     return np.asarray(reward * moving, dtype=get_global_dtype())
 
 
@@ -217,3 +247,25 @@ def feet_slide(
     to keep on during gait discovery. Takes a NEGATIVE weight.
     """
     return np.asarray(np.sum(foot_speed_xy * contact, axis=1), dtype=get_global_dtype())
+
+
+def feet_clearance(
+    ctx: RewardContext,
+    foot_z: np.ndarray,
+    foot_speed_xy: np.ndarray,
+    ground_z: float,
+    target: float,
+) -> np.ndarray:
+    """Clock-FREE swing-clearance cost (≥0): squared foot-height error × horizontal
+    foot speed, summed over feet.
+
+    ``err = ((foot_z − ground_z) − target)² · horizontal_speed``. A PLANTED foot
+    (speed ≈ 0) is never charged; a foot moving horizontally (mid-swing) is pulled
+    toward the apex ``target``. This sets step HEIGHT without any gait clock and
+    without rewarding a parked-up foot, and it is NEUTRAL on cadence, so it does
+    not fight ``feet_air_time`` (the clock-free cadence driver). Paired: air-time
+    picks the swing LENGTH (slow), clearance picks the swing HEIGHT. Ported from
+    IsaacLab's ``feet_clearance``. Takes a NEGATIVE weight.
+    """
+    err = np.square((foot_z - ground_z) - target)  # (N, 2)
+    return np.asarray(np.sum(err * foot_speed_xy, axis=1), dtype=get_global_dtype())

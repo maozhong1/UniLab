@@ -27,41 +27,54 @@ env:
 reward:
   # UniLab sign convention: rewards >=0 with positive weight, penalties >=0 with
   # negative weight. Every Episode_Reward/<penalty> must read <=0 in the logs.
+  # ── Run F: CLOCK-FREE gait recipe ────────────────────────────────────────────
+  # Runs A–E chased cadence with a gait CLOCK (feet_phase / _contrast /
+  # _contact_schedule). Root cause of their failure: the gait phase is NOT in the
+  # frozen 61D obs AND is seeded at a random phase per episode, so the policy
+  # literally cannot observe or phase-lock to it — feet_contact_schedule sat at the
+  # chance baseline (~0.45) for an entire 800-iter Stage B. So the clock rewards are
+  # DISABLED here (weight 0) and the walk is driven by clock-free terms only, the
+  # way microduck_rl's velocity walk (same 61D contract) actually works:
+  #   feet_air_time  — landing (air−thr), the sole CADENCE driver (prefers long swings)
+  #   feet_clearance — clock-free swing HEIGHT cost (pull moving foot to apex)
+  #   feet_double_stance / feet_slide — leave double support, don't drag
   scales:
     # positive-weight rewards
     track_linear_velocity: 2.0
     track_angular_velocity: 2.0
     head_pose_tracking: 1.0
-    # RETUNE (2026-09-05): upright 2.0 -> 1.0. The 2.0 dense uprightness term was
-    # the biggest reward and over-paid STILLNESS, so lifting a foot (transient
-    # wobble) never paid off and the policy skated. Termination at 60deg tilt still
-    # keeps it upright.
     upright: 1.0
     alive: 0.5
-    # Phase 4.5 foot-gait. Prior run: a drag/shuffle sat in a local optimum
-    # (feet_air_time fell 0.10->0.03 over training). RETUNE strengthens the
-    # ungameable stepping signal and adds a direct anti-drag cost:
-    #   feet_phase          — swing-foot height tracks the gait clock
-    #   feet_phase_contrast — L/R height DIFFERENCE tracks the clock (1->2: force alternation)
-    #   feet_air_time       — single-stance air time; drag/hover scores 0 (3->8: dominant)
-    feet_phase: 1.0
-    feet_phase_contrast: 2.0
-    feet_air_time: 8.0
+    # CADENCE driver (clock-free, landing-settled). Now uncontested on the swing-
+    # length dimension (the clock rewards that used to dwarf it are off) → the
+    # policy lengthens swings to turn this from negative to positive. Dominant weight.
+    # Run G (2026-09-07): 12 → 24. Run F eval = stable, lifts feet, but FAST walk;
+    # feet_air_time plateaued at ~-0.05 (weighted) from iter ~200 to 700, never
+    # crossing zero — its per-step reward mass (~-0.05) was ~1/100 of the +6.0
+    # positive stack, too weak to pay the balance cost of longer single-support.
+    # Doubling the weight strengthens the pull toward longer swings (lower cadence).
+    # Watch: feet_air_time should now climb neg→0→pos; if track_linear_velocity
+    # collapses (walk too slow), dial back toward ~18.
+    feet_air_time: 24.0
+    # DISABLED — clock-referenced, unobservable in the 61D obs (see header). Kept as
+    # named terms (weight 0 = skipped) so the machinery/tests stay intact.
+    feet_phase: 0.0
+    feet_phase_contrast: 0.0
+    feet_contact_schedule: 0.0
     # negative-weight penalties
     leg_pose: -0.5
-    # Smoothness tax kept low during skill discovery (AGENTS.md: an attempt-tax
-    # active while a hard skill is explored makes "do nothing" win). Raise/curriculum
-    # AFTER a gait emerges. Smoke showed weighted action_rate ~-2.9 at -0.1.
     action_rate: -0.01
     lin_vel_z: -0.5
     ang_vel_xy: -0.05
-    # Anti-skate: penalize planted-foot horizontal speed (contact-gated). Kept
-    # deliberately WEAK at -0.1 — microduck_rl found -1.0 too restrictive (froze
-    # the gait). Let air_time drive the stepping; slide only trims residual drag.
-    feet_slide: -0.1
-    # RETUNE anti-drag: cost per step for BOTH feet on ground while moving. This is
-    # the missing gradient OUT of the double-stance shuffle basin (idle envs exempt).
-    feet_double_stance: -1.5
+    # Anti-skate: planted-foot horizontal speed (contact-gated).
+    feet_slide: -0.15
+    # clock-free swing-HEIGHT cost: (foot_z−target)²·horizontal_speed → pulls a
+    # moving foot to the apex; sets step height, neutral on cadence.
+    feet_clearance: -0.5
+    # Anti-drag: cost for BOTH feet on ground while moving — leave double support.
+    # Moderate (not -1.5): the clock-free air_time no longer rewards fast steps, so
+    # this only needs to break the double-stance basin, not force 0% double support.
+    feet_double_stance: -0.5
   lin_vel_sigma: 0.1
   ang_vel_sigma: 0.5
   head_pose_std: 0.5
@@ -70,11 +83,18 @@ reward:
   # at ground under STAND); swing_height ~g1-proportional to base_z 0.115; sigma
   # tuned so the current sliding policy already scores visibly (AGENTS.md).
   gait_frequency: 1.5
+  # Duty cycle: stance fraction of each foot's gait cycle. 0.6 = a walk (with a
+  # ~20% double-support overlap at anti-phase); the swing 0.4 fraction is when the
+  # foot must be lifted/airborne. Drives both the swing-height target (0 in stance)
+  # and feet_contact_schedule (planted in stance, air in swing).
+  gait_duty: 0.6
   feet_swing_height: 0.02
   feet_ground_z: 0.0
   feet_phase_sigma: 0.0004
   feet_slide_contact_threshold: 0.5
   feet_min_cmd_norm: 0.05
+  # Clock-free swing apex height (feet_clearance target), metres. ~robot-scale step.
+  feet_clearance_target: 0.03
   # Air-time LANDING reward (feet_air_time_landing). RETUNE (2026-09-05, Run D):
   # the windowed hard-floor air-time (Run B/C) was flat-zero below 0.15s with NO
   # gradient, so a ~0.10s fast gait could never bootstrap over the cliff and
@@ -82,29 +102,21 @@ reward:
   # clip(last_air_time − threshold, ±cap), SIGNED — short swings land negative
   # (fast shuffle penalised), long swings positive, smooth gradient both sides →
   # pulls swings longer from anywhere. threshold ≈ target min swing (microduck_rl ~0.125-0.2).
-  feet_air_time_landing_threshold: 0.20
-  feet_air_time_landing_cap: 0.15
+  feet_air_time_landing_threshold: 0.18
+  feet_air_time_landing_cap: 0.20
   # ── 2-stage gait curriculum ──────────────────────────────────────────────────
-  # The scales/kernels above are STAGE A ("break the drag": strong double_stance +
-  # air_time, fast 1.5Hz clock → get alternating stepping). At iter 150 the env
-  # switches to STAGE B ("refine to a WALK, not a run").
-  # RETUNE history:
-  #  - Run A (Stage B double_stance -0.5, OLD non-windowed air-time): 5.4 step/s RUN
-  #    (0% double support) — the old air-time paid for fast steps.
-  #  - Run B (Stage B double_stance 0.0, NEW windowed air-time): feet_air_time
-  #    collapsed to ~0 for 185 iters — removing double_stance killed the pressure
-  #    off double support, and the windowed air-time's 0.15s hard floor gives no
-  #    gradient below it → policy sat in a double-stance tap shuffle.
-  #  - Run C (THIS): windowed air-time (Run B's good half) + double_stance BACK to
-  #    -0.5. double_stance provides the low-end "leave double support" gradient;
-  #    windowed air-time provides the high-end "make swings LONG (slow)" reward and,
-  #    unlike the old air-time, pays 0 for fast steps → -0.5 no longer → a run.
-  curriculum_enabled: true
+  # DISABLED for the Run F clock-free recipe: the two-stage curriculum was built
+  # around the gait clock (Stage A fast clock → Stage B slow clock) and its Stage-B
+  # overrides re-activate the now-disabled clock rewards. A single coherent
+  # clock-free scale set is cleaner to attribute. The mechanism + Stage-B fields are
+  # retained (and unit-tested) so a clock/curriculum approach can be re-enabled.
+  curriculum_enabled: false
   curriculum_stage_b_iter: 150
   curriculum_num_steps_per_env: 24
   stage_b_feet_double_stance: -0.5
   stage_b_feet_phase: 3.0
   stage_b_feet_phase_contrast: 3.0
+  stage_b_feet_contact_schedule: 3.0
   stage_b_feet_air_time: 10.0
   stage_b_feet_slide: -0.2
   stage_b_feet_swing_height: 0.03

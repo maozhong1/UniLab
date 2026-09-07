@@ -72,11 +72,13 @@ class MicroduckVelocityRewardCfg:
     # placeholders; the owner YAML sets the measured values (see the measurement
     # step in the port plan). swing_height/ground_z in metres.
     gait_frequency: float = 1.5            # Hz; gait clock speed
+    gait_duty: float = 0.6                 # stance fraction of the cycle (walk ≈ 0.6)
     feet_swing_height: float = 0.02        # target peak foot-site clearance
     feet_ground_z: float = 0.0             # measured stance foot-site world Z
     feet_phase_sigma: float = 4.0e-4       # exp kernel width (scaled to swing_height)
     feet_slide_contact_threshold: float = 0.5  # contact-sensor scalar → in-contact
     feet_min_cmd_norm: float = 0.05        # twist-norm gate for feet_phase
+    feet_clearance_target: float = 0.03    # clock-free swing apex height (feet_clearance)
     # Air-time LANDING reward (feet_air_time_landing). Settles once per step at
     # touchdown: pays clip(last_air_time − threshold, ±cap) per landing foot —
     # SIGNED, so short swings are penalised and long swings rewarded, with a
@@ -107,6 +109,7 @@ class MicroduckVelocityRewardCfg:
     stage_b_feet_double_stance: float = -0.5
     stage_b_feet_phase: float = 3.0            # reward lifting HIGH
     stage_b_feet_phase_contrast: float = 3.0   # track the (now slower) clock harder
+    stage_b_feet_contact_schedule: float = 3.0  # tie CONTACT (cadence) to the clock, hard
     stage_b_feet_air_time: float = 10.0        # longer swings → more air time
     stage_b_feet_slide: float = -0.2           # trim residual slip
     stage_b_feet_swing_height: float = 0.03    # aim higher
@@ -175,6 +178,7 @@ class MicroduckVelocityEnv(MicroduckBaseEnv):
                 rc.feet_ground_z,
                 rc.feet_phase_sigma,
                 rc.feet_min_cmd_norm,
+                rc.gait_duty,
             ),
             # (2) L/R height DIFFERENCE tracks the clock — breaks the hover basin,
             "feet_phase_contrast": lambda ctx: md_rewards.feet_phase_contrast(
@@ -183,6 +187,13 @@ class MicroduckVelocityEnv(MicroduckBaseEnv):
                 rc.feet_swing_height,
                 rc.feet_phase_sigma,
                 rc.feet_min_cmd_norm,
+                rc.gait_duty,
+            ),
+            # (2b) CONTACT state tracks the clock schedule — the cadence lever. Ties
+            #      foot planted/airborne to the duty-cycle clock; a fast shuffle out
+            #      of phase with the slow clock scores low → forces clock-synced cadence.
+            "feet_contact_schedule": lambda ctx: md_rewards.feet_contact_schedule(
+                ctx, self._foot_contact(), rc.gait_duty, rc.feet_min_cmd_norm
             ),
             # (3) LANDING air time — the dominant driver, settled at touchdown.
             #     SIGNED: a swing shorter than the threshold lands NEGATIVE (fast
@@ -206,6 +217,15 @@ class MicroduckVelocityEnv(MicroduckBaseEnv):
             # anti-skate: penalize planted-foot horizontal speed (negative weight).
             "feet_slide": lambda ctx: md_rewards.feet_slide(
                 ctx, self._foot_speed_xy(), self._foot_contact()
+            ),
+            # clock-free swing clearance cost: pull a horizontally-moving foot to the
+            # apex height `feet_clearance_target` (sets step HEIGHT; negative weight).
+            "feet_clearance": lambda ctx: md_rewards.feet_clearance(
+                ctx,
+                self._foot_pos_z(),
+                self._foot_speed_xy(),
+                rc.feet_ground_z,
+                rc.feet_clearance_target,
             ),
             # anti-drag: penalize both-feet-on-ground while moving — pushes the
             # policy out of the double-stance shuffle basin (negative weight).
@@ -256,6 +276,7 @@ class MicroduckVelocityEnv(MicroduckBaseEnv):
             "feet_double_stance": rc.stage_b_feet_double_stance,
             "feet_phase": rc.stage_b_feet_phase,
             "feet_phase_contrast": rc.stage_b_feet_phase_contrast,
+            "feet_contact_schedule": rc.stage_b_feet_contact_schedule,
             "feet_air_time": rc.stage_b_feet_air_time,
             "feet_slide": rc.stage_b_feet_slide,
         }
