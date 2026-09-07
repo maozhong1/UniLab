@@ -1,0 +1,111 @@
+# @package _global_
+# Microduck velocity/walk (v1, IMU-only reward). Owner config: carries the
+# cross-backend contract inline (env + reward) plus mujoco tuning.
+#
+# empirical_normalization: false is deliberate — the exported ONNX then takes
+# the RAW 61D obs, which is exactly what microduck_rl's infer_policy.py / the
+# real runtime feed. That keeps the Phase-6 cross-framework check normalizer-free
+# (no baked obs normalizer to reconcile between the two rsl_rl variants).
+training:
+  task_name: MicroduckVelocityFlat
+  sim_backend: mujoco
+algo:
+  num_envs: 4096
+  num_steps_per_env: 24
+  max_iterations: 3000
+  empirical_normalization: false
+  experiment_name: microduck_velocity_flat
+  obs_groups:
+    actor:
+      - actor
+  policy:
+    actor_hidden_dims: [512, 256, 128]
+    critic_hidden_dims: [512, 256, 128]
+env:
+  noise_config:
+    level: 1.0
+reward:
+  # UniLab sign convention: rewards >=0 with positive weight, penalties >=0 with
+  # negative weight. Every Episode_Reward/<penalty> must read <=0 in the logs.
+  scales:
+    # positive-weight rewards
+    track_linear_velocity: 2.0
+    track_angular_velocity: 2.0
+    head_pose_tracking: 1.0
+    # RETUNE (2026-09-05): upright 2.0 -> 1.0. The 2.0 dense uprightness term was
+    # the biggest reward and over-paid STILLNESS, so lifting a foot (transient
+    # wobble) never paid off and the policy skated. Termination at 60deg tilt still
+    # keeps it upright.
+    upright: 1.0
+    alive: 0.5
+    # Phase 4.5 foot-gait. Prior run: a drag/shuffle sat in a local optimum
+    # (feet_air_time fell 0.10->0.03 over training). RETUNE strengthens the
+    # ungameable stepping signal and adds a direct anti-drag cost:
+    #   feet_phase          — swing-foot height tracks the gait clock
+    #   feet_phase_contrast — L/R height DIFFERENCE tracks the clock (1->2: force alternation)
+    #   feet_air_time       — single-stance air time; drag/hover scores 0 (3->8: dominant)
+    feet_phase: 1.0
+    feet_phase_contrast: 2.0
+    feet_air_time: 8.0
+    # negative-weight penalties
+    leg_pose: -0.5
+    # Smoothness tax kept low during skill discovery (AGENTS.md: an attempt-tax
+    # active while a hard skill is explored makes "do nothing" win). Raise/curriculum
+    # AFTER a gait emerges. Smoke showed weighted action_rate ~-2.9 at -0.1.
+    action_rate: -0.01
+    lin_vel_z: -0.5
+    ang_vel_xy: -0.05
+    # Anti-skate: penalize planted-foot horizontal speed (contact-gated). Kept
+    # deliberately WEAK at -0.1 — microduck_rl found -1.0 too restrictive (froze
+    # the gait). Let air_time drive the stepping; slide only trims residual drag.
+    feet_slide: -0.1
+    # RETUNE anti-drag: cost per step for BOTH feet on ground while moving. This is
+    # the missing gradient OUT of the double-stance shuffle basin (idle envs exempt).
+    feet_double_stance: -1.5
+  lin_vel_sigma: 0.1
+  ang_vel_sigma: 0.5
+  head_pose_std: 0.5
+  upright_std: 0.2236
+  # Foot-gait kernel params (Phase 4.5). feet_ground_z measured ~0 (foot sites sit
+  # at ground under STAND); swing_height ~g1-proportional to base_z 0.115; sigma
+  # tuned so the current sliding policy already scores visibly (AGENTS.md).
+  gait_frequency: 1.5
+  feet_swing_height: 0.02
+  feet_ground_z: 0.0
+  feet_phase_sigma: 0.0004
+  feet_slide_contact_threshold: 0.5
+  feet_min_cmd_norm: 0.05
+  # Air-time LANDING reward (feet_air_time_landing). RETUNE (2026-09-05, Run D):
+  # the windowed hard-floor air-time (Run B/C) was flat-zero below 0.15s with NO
+  # gradient, so a ~0.10s fast gait could never bootstrap over the cliff and
+  # feet_air_time sat at ~0 for the whole of Stage B. This settles at touchdown:
+  # clip(last_air_time − threshold, ±cap), SIGNED — short swings land negative
+  # (fast shuffle penalised), long swings positive, smooth gradient both sides →
+  # pulls swings longer from anywhere. threshold ≈ target min swing (microduck_rl ~0.125-0.2).
+  feet_air_time_landing_threshold: 0.20
+  feet_air_time_landing_cap: 0.15
+  # ── 2-stage gait curriculum ──────────────────────────────────────────────────
+  # The scales/kernels above are STAGE A ("break the drag": strong double_stance +
+  # air_time, fast 1.5Hz clock → get alternating stepping). At iter 150 the env
+  # switches to STAGE B ("refine to a WALK, not a run").
+  # RETUNE history:
+  #  - Run A (Stage B double_stance -0.5, OLD non-windowed air-time): 5.4 step/s RUN
+  #    (0% double support) — the old air-time paid for fast steps.
+  #  - Run B (Stage B double_stance 0.0, NEW windowed air-time): feet_air_time
+  #    collapsed to ~0 for 185 iters — removing double_stance killed the pressure
+  #    off double support, and the windowed air-time's 0.15s hard floor gives no
+  #    gradient below it → policy sat in a double-stance tap shuffle.
+  #  - Run C (THIS): windowed air-time (Run B's good half) + double_stance BACK to
+  #    -0.5. double_stance provides the low-end "leave double support" gradient;
+  #    windowed air-time provides the high-end "make swings LONG (slow)" reward and,
+  #    unlike the old air-time, pays 0 for fast steps → -0.5 no longer → a run.
+  curriculum_enabled: true
+  curriculum_stage_b_iter: 150
+  curriculum_num_steps_per_env: 24
+  stage_b_feet_double_stance: -0.5
+  stage_b_feet_phase: 3.0
+  stage_b_feet_phase_contrast: 3.0
+  stage_b_feet_air_time: 10.0
+  stage_b_feet_slide: -0.2
+  stage_b_feet_swing_height: 0.03
+  stage_b_gait_frequency: 1.0
