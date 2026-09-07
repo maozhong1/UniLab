@@ -71,6 +71,11 @@ mjwarp = [
     "warp-lang>=1.14.0",
 ]
 motrix = ["motrixsim-core==0.8.2"]
+# BAM XL330 actuator model — the sim2real-critical voltage/friction model every
+# microduck policy is trained against (import name `bam`). Opt-in extra so it
+# never perturbs UniLab's default resolution. Upstream pins requires-python
+# <3.13, so gate the marker (venv is 3.12); on 3.13 the extra resolves empty.
+microduck = ["better-actuator-models ; python_version >= '3.12' and python_version < '3.13'"]
 viser = ["viser>=1.0.26", "trimesh>=3.21.7"]
 
 [dependency-groups]
@@ -92,9 +97,21 @@ torch = [
     { index = "pytorch-cu128", marker = "sys_platform=='linux' and platform_machine=='x86_64'" },
     { index = "pytorch-cu128", marker = "sys_platform=='win32'" },
 ]
+# microduck `microduck` extra: BAM from Rhoban's mjlab_frictionloss branch.
+better-actuator-models = { git = "https://github.com/Rhoban/bam.git", branch = "mjlab_frictionloss" }
 
 [tool.uv]
 exclude-dependencies = ["torchvision"]
+# Only bite when the `microduck` extra pulls in bam (mirrors microduck_rl):
+# bam pins protobuf<4.0 and drags onnx down to a version with no prebuilt
+# wheel; keep both on wheel-having versions. bam also depends on the invalid
+# PyPI stub `zmq==0.0.0` — we only use bam.model/actuator/mujoco, so drop it
+# via an always-false marker.
+override-dependencies = [
+    "protobuf>=4.0,<7.0",
+    "onnx>=1.20.1",
+    "zmq ; python_version < '3.0'",
+]
 # Build mujoco-uni-runtime against the mujoco version locked in this project
 # environment instead of an isolated build env (its native extension records
 # the build-time mujoco version and refuses to load on mismatch). Prebuilt
