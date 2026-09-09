@@ -35,16 +35,45 @@ algo:
     pretrained_ckpt: null    # set to sonic_release/last.pt to warm-start G1 weights
     distribution_cfg:
       class_name: GaussianDistribution
-      init_std: 1.0          # 0.05 to mirror sonic's trained std (small exploration)
+      init_std: 0.5          # was 1.0 (official) but at std~1 the action_rate noise
+                             # floor (~-5) makes per-step reward net-negative -> agent
+                             # learns to die fast. 0.5 quarters that floor. Anneal up later.
       std_type: scalar
   critic:
+    # Level-A critic upgrade (see G1SonicMotionTrackingCfg.critic_include_future): the
+    # value net now consumes 926 (286 privileged body state + 640 future reference).
+    # Bigger SiLU MLP toward SONIC's official critic (1645->2048x2->1024x2->512x2 SiLU)
+    # to fit the value fn over 1000 diverse clips. obs_normalization=RunningMeanStd, as
+    # official. Shrink back to [512,256,128]/elu (+critic_include_future=false) to A/B.
     class_name: rsl_rl.models.MLPModel
-    hidden_dims: [512, 256, 128]
-    activation: elu
+    hidden_dims: [1024, 1024, 512, 512]
+    activation: swish   # rsl_rl key for SiLU (official critic activation)
     obs_normalization: true
   algorithm:
     entropy_coef: 0.005
 env:
+  # Match warm-start / SONIC deploy physics rate (200 Hz). The G1 base default is
+  # 0.02/3 (~150 Hz); sonic_warm.yaml uses 0.005, so pin full-train here too to
+  # keep dynamics identical across warm and full runs (control stays 50 Hz via
+  # decimation 4).
+  sim_dt: 0.005
+  # --- from-scratch full-train: keep the joint interface self-consistent ------
+  # Warm-start (sonic_warm.yaml) uses BOTH perms True so the pretrained last.pt
+  # decoder (IsaacLab-order out) drives the right joints. For from-scratch we do
+  # NOT reuse last.pt, so both sides are set to MuJoCo order (identity in/out):
+  # obs joint terms and the action output share one order and the net does not
+  # have to internalise a fixed 29-joint permutation. Both flags MUST flip
+  # together — mixing them (True/False) is the awkward middle state.
+  mujoco_to_isaaclab_perm: false
+  action_output_isaaclab_to_mujoco: false
+  # --- loosen SONIC's strict tracking-error terminators for from-scratch -------
+  # The 0.2/0.2/0.30 defaults are calibrated for a warm-started policy that
+  # already tracks; a cold policy trips foot-pos (0.2 m) almost immediately and
+  # gets reset at ~26 steps (~0.5 s), never accumulating horizon. Loosened here;
+  # anneal back toward 0.2/0.2/0.30 once mean episode length climbs (>100 steps).
+  strict_foot_pos_threshold: 0.5        # 0.2 -> 0.5 m
+  strict_anchor_ori_error_sq: 0.7       # 0.2 -> 0.7  (~47 deg pelvis ori error)
+  strict_height_threshold: 0.45         # 0.30 -> 0.45 m
 reward:
   scales:
     motion_global_root_pos: 0.5
@@ -55,7 +84,10 @@ reward:
     motion_body_ang_vel: 1.0
     motion_joint_pos: 0.0
     motion_joint_vel: 0.0
-    action_rate_l2: -0.1
+    action_rate_l2: -0.01   # was -0.1; at std~1 the noise-dominated action_rate
+                            # penalty (~-5) drove per-step reward net-negative and the
+                            # agent learned to terminate ASAP. Anneal back to -0.05/-0.1
+                            # for smoothness once episode length climbs past ~100 steps.
     joint_limit: -10.0
   std_root_pos: 0.3
   std_root_ori: 0.4

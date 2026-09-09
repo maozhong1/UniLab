@@ -14,6 +14,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."   # -> UniLab root
 
 MODE="${1:-smoke}"
+TASK="${TASK:-g1_motion_tracking/sonic}"      # owner YAML to compose; override to reuse this driver for another task
 NPZ_DIR="${NPZ_DIR:-/home/maozhong/work/sonic_vla_infer/bones_seed_subset/npz}"
 # Default to ./last.pt at the repo root (the script cd's there above). Override with
 # CKPT=/abs/path/to/sonic_release/last.pt.
@@ -86,12 +87,12 @@ if [[ -n "$TARGET_KL_STOP" ]]; then
   TARGET_KL_ARG="algo.algorithm.target_kl_stop=$TARGET_KL_STOP"
 fi
 
-echo "[train_warm] mode=$MODE device=$DEVICE envs=$NUM_ENVS iters=$ITERS save=$SAVE lr=$LR encoder_lr=${ENCODER_LR:-<=lr>} critic_lr=${CRITIC_LR:-<=lr>} critic_warmup=${CRITIC_WARMUP:-0} steps_per_env=${NUM_STEPS_PER_ENV:-<default>} sampling_mode=${SAMPLING_MODE:-<default:adaptive>} target_kl_stop=${TARGET_KL_STOP:-<disabled>} freeze_encoder=$FREEZE_ENCODER"
+echo "[train_warm] task=$TASK mode=$MODE device=$DEVICE envs=$NUM_ENVS iters=$ITERS save=$SAVE lr=$LR encoder_lr=${ENCODER_LR:-<=lr>} critic_lr=${CRITIC_LR:-<=lr>} critic_warmup=${CRITIC_WARMUP:-0} steps_per_env=${NUM_STEPS_PER_ENV:-<default>} sampling_mode=${SAMPLING_MODE:-<default:adaptive>} target_kl_stop=${TARGET_KL_STOP:-<disabled>} freeze_encoder=$FREEZE_ENCODER"
 echo "[train_warm] ckpt=$CKPT"
 echo "[train_warm] motions=$(echo "$LIST" | tr ',' '\n' | wc -l) clips from $NPZ_DIR"
 
 HF_ENDPOINT=https://hf-mirror.com uv run --no-sync python scripts/train_rsl_rl.py \
-  task=g1_motion_tracking/sonic training.device="$DEVICE" training.no_play=true \
+  task="$TASK" training.device="$DEVICE" training.no_play=true \
   algo.actor.pretrained_ckpt="$CKPT" \
   algo.actor.freeze_encoder="$FREEZE_ENCODER" \
   algo.actor.distribution_cfg.init_std=0.05 \

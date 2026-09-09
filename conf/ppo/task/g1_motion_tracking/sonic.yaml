@@ -44,9 +44,14 @@ algo:
       init_std: 0.05         # mirror sonic's trained std (small exploration for warm-start)
       std_type: scalar
   critic:
+    # Level-A critic (matches sonic.yaml): consumes 926 = 286 privileged body state +
+    # 640 future reference (env.critic_include_future below). Bigger SiLU MLP toward
+    # SONIC's official critic. Safe for warm: the critic is training-only, never
+    # deployed, and is NOT loaded from last.pt (load_g1_from_last_pt is actor-only), so
+    # it starts fresh regardless -- CRITIC_WARMUP handles the burn-in.
     class_name: rsl_rl.models.MLPModel
-    hidden_dims: [512, 256, 128]
-    activation: elu
+    hidden_dims: [1024, 1024, 512, 512]
+    activation: swish   # rsl_rl key for SiLU
     obs_normalization: true
   algorithm:
     entropy_coef: 0.005
@@ -56,6 +61,11 @@ algo:
 env:
   sim_dt: 0.005
   action_output_isaaclab_to_mujoco: true
+  # Level-A: feed the value net the actor's 640-d multi-future command+anchor so it
+  # sees the reference horizon (default is already true; set explicitly here so this
+  # warm config is self-documenting and robust to future default changes). Pairs with
+  # the 926-input SiLU critic above.
+  critic_include_future: true
 reward:
   scales:
     motion_global_root_pos: 0.5

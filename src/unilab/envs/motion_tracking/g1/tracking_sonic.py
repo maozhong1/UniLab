@@ -179,6 +179,14 @@ class G1SonicMotionTrackingCfg(MotionTrackingCfg):
     # base_ang_vel = pelvis gyro (sonic root ang-vel), not torso. pelvis_local_linvel
     # is already the pelvis sensor in the stock cfg; only gyro needs switching.
     sensor: Sensor = field(default_factory=lambda: Sensor(gyro="pelvis_gyro"))
+    # Level-A critic fix: append the actor's multi-future command+anchor (the 640-d
+    # encoder INPUT, un-quantized) to the stock 286-d privileged critic obs. The stock
+    # critic only sees the SINGLE current reference frame, so it is blind to the upcoming
+    # reference horizon the actor tracks -> it cannot predict return -> irreducible value
+    # error (persistent vloss). With this on, critic obs = 286 + 640 = 926: privileged
+    # body state (more than the actor) AND the future reference (like the actor). Pair
+    # with a bigger SiLU critic MLP in sonic.yaml. Set False to restore the stock 286.
+    critic_include_future: bool = True
 
 
 @registry.env("G1SonicMotionTracking", sim_backend="mujoco")
@@ -248,7 +256,10 @@ class G1SonicMotionTrackingEnv(MotionTrackingEnv):
     # left at the stock value so super's internal allocation stays correct.
     @property
     def obs_groups_spec(self) -> dict[str, int]:
-        return {"obs": self._sonic_actor_dim, "critic": self._critic_obs_width}
+        critic_width = self._critic_obs_width
+        if self._cfg.critic_include_future:
+            critic_width += self._enc_dim  # +640 multi-future command+anchor
+        return {"obs": self._sonic_actor_dim, "critic": critic_width}
 
     # -- future-frame gather ------------------------------------------------
     def _gather_future(self, env_ids: np.ndarray | None):
@@ -518,4 +529,9 @@ class G1SonicMotionTrackingEnv(MotionTrackingEnv):
         actor = self._build_sonic_actor(
             info, dof_pos, dof_vel, gyro, robot_body_pos_w, robot_body_quat_w
         )
-        return {"obs": actor, "critic": base["critic"]}
+        critic = base["critic"]
+        if self._cfg.critic_include_future:
+            # actor[:, :enc_dim] IS the 640-d encoder input (multi-future command+anchor);
+            # give the value net the same reference horizon the actor sees.
+            critic = np.concatenate([critic, actor[:, : self._enc_dim]], axis=1, dtype=critic.dtype)
+        return {"obs": actor, "critic": critic}
