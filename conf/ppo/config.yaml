@@ -44,6 +44,7 @@ algo:
     lam: 0.95
     desired_kl: 0.01
     target_kl_stop: null
+    adaptive_lr_max: null   # cap the adaptive-KL shared LR (base rsl-rl hardcodes 1e-2); SONIC from-scratch uses 2e-4
     max_grad_norm: 1.0
     adaptive_kl_beta: 0.9
     adaptive_lr_growth: 1.1

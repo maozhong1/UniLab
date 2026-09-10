@@ -40,13 +40,18 @@ algo:
                              # learns to die fast. 0.5 quarters that floor. Anneal up later.
       std_type: scalar
   critic:
-    # Level-A critic upgrade (see G1SonicMotionTrackingCfg.critic_include_future): the
-    # value net now consumes 926 (286 privileged body state + 640 future reference).
-    # Bigger SiLU MLP toward SONIC's official critic (1645->2048x2->1024x2->512x2 SiLU)
-    # to fit the value fn over 1000 diverse clips. obs_normalization=RunningMeanStd, as
-    # official. Shrink back to [512,256,128]/elu (+critic_include_future=false) to A/B.
+    # Level-A critic (see G1SonicMotionTrackingCfg.critic_include_future): the value net
+    # consumes 926 = 286 privileged body state + 640 multi-future command+anchor (mf, F=10).
+    # EXP1+2: enlarged toward SONIC's official from-scratch critic. The official bones_seed
+    # critic is [4096,4096,2048,2048,1024,1024,512,512] SiLU (8 layers); we use the 6-layer
+    # [2048,2048,1024,1024,512,512] as the XPU-affordable step up from the 4-layer 1024 net
+    # (that 4-layer net could not fit the value fn over 1000 diverse clips -> noisy
+    # advantages -> non-convergence). obs_normalization=RunningMeanStd, as official.
+    # NOTE: the 286 privileged body-state block is SINGLE-FRAME here; official adds hist=10
+    # to it (privileged_mf_hist) -- that needs an env change, deferred. Shrink back to
+    # [512,256,128]/elu (+critic_include_future=false) to A/B.
     class_name: rsl_rl.models.MLPModel
-    hidden_dims: [1024, 1024, 512, 512]
+    hidden_dims: [2048, 2048, 1024, 1024, 512, 512]
     activation: swish   # rsl_rl key for SiLU (official critic activation)
     obs_normalization: true
   algorithm:
