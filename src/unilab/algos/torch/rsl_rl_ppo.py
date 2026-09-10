@@ -29,6 +29,7 @@ class FinalObservationAwarePPO(PPO):
         critic_lr: float | None = None,
         critic_warmup_iters: int = 0,
         target_kl_stop: float | None = None,
+        adaptive_lr_max: float | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -56,6 +57,16 @@ class FinalObservationAwarePPO(PPO):
             logger.info(
                 f"[target_kl_stop] KL early-stop guardrail active: stop applying gradient "
                 f"steps for an iteration once minibatch mean KL > {self._target_kl_stop:g}."
+            )
+        # Cap the adaptive-KL schedule's SHARED LR at this ceiling. base rsl-rl hardcodes a
+        # 1e-2 ceiling; SONIC's from-scratch recipe caps the shared LR at 2e-4 (init 2e-5,
+        # floor 1e-5) so a persistently-small KL cannot inflate the LR into the value-
+        # divergence regime. None = keep base 1e-2 behaviour. Only affects schedule='adaptive'.
+        self._adaptive_lr_max = float(adaptive_lr_max) if adaptive_lr_max is not None else None
+        if self._adaptive_lr_max is not None:
+            logger.info(
+                f"[adaptive_lr_max] adaptive-KL LR ceiling set to {self._adaptive_lr_max:g} "
+                f"(base rsl-rl default ceiling is 1e-2)."
             )
 
     def _setup_critic_warmup(self, critic_warmup_iters: int) -> None:
@@ -135,6 +146,23 @@ class FinalObservationAwarePPO(PPO):
             f"[critic_warmup] done after {self._critic_warmup_iters} iters -> actor unfrozen; "
             f"resuming normal actor+critic PPO updates.{note}"
         )
+
+    def _apply_adaptive_lr_ceiling(self) -> None:
+        """Clamp the adaptive-KL shared LR at ``adaptive_lr_max`` (SONIC from-scratch: 2e-4).
+
+        base rsl-rl's adaptive schedule hardcodes a 1e-2 ceiling and rewrites the param-group
+        LRs inside its own ``update()``; when the from-scratch path defers to that base update
+        (``_update_inner`` -> ``super().update()``) we re-cap here so a persistently-small KL
+        cannot ramp the shared LR past the SONIC ceiling. Respects per-group ``lr_scale``.
+        No-op unless the schedule is adaptive and a ceiling is configured.
+        """
+        if self._adaptive_lr_max is None or self.schedule != "adaptive":
+            return
+        if self.learning_rate <= self._adaptive_lr_max:
+            return
+        self.learning_rate = self._adaptive_lr_max
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = self.learning_rate * param_group.get("lr_scale", 1.0)
 
     def _setup_lr_groups(self, encoder_lr: float | None, critic_lr: float | None) -> None:
         """Give the encoder and/or the critic their own (absolute) LR param groups.
@@ -442,7 +470,8 @@ class FinalObservationAwarePPO(PPO):
                 if kl_mean > self.desired_kl * 2.0:
                     self.learning_rate = max(1e-5, self.learning_rate / 1.5)
                 elif 0.0 < kl_mean < self.desired_kl / 2.0:
-                    self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                    ceiling = self._adaptive_lr_max if self._adaptive_lr_max is not None else 1e-2
+                    self.learning_rate = min(ceiling, self.learning_rate * 1.5)
                 for param_group in self.optimizer.param_groups:
                     param_group["lr"] = self.learning_rate * param_group.get("lr_scale", 1.0)
 
@@ -501,7 +530,11 @@ class FinalObservationAwarePPO(PPO):
         # is false); the eager path (target_kl_stop and/or split-LR+adaptive) is handled in
         # update() via _update_eager, which uses the model-agnostic rsl-rl API.
         if not self._supports_compiled_update_path():
-            return cast(dict[str, float], super().update())
+            metrics = cast(dict[str, float], super().update())
+            # base rsl-rl adapted+applied the LR under its own 1e-2 ceiling; re-cap at the
+            # SONIC ceiling (from-scratch path defers the adaptive step to base update()).
+            self._apply_adaptive_lr_ceiling()
+            return metrics
 
         mean_value_loss = 0.0
         mean_surrogate_loss = 0.0
