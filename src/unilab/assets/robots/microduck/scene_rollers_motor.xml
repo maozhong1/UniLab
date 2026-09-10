@@ -21,6 +21,19 @@
         <light pos="0 0 3.5" dir="0 0 -1" directional="true" />
         <geom name="floor" size="0 0 0.05" pos="0 0 0" type="plane" material="groundplane" />
     </worldbody>
+    <!-- Contact sensors (reward-only, NOT in the 61D obs). Mirrors microduck_rl's
+         roller ContactSensorCfg: the blade has no sole geom, so each foot's contact
+         is its two tires — scope the second side by the ankle SUBTREE (subtree-mode,
+         like the source's ContactMatch(mode="subtree", pattern="ankle_{l,r}_v1")).
+         Scalar per foot (data="found"): >=1 in contact, 0 in swing. Left first. -->
+    <sensor>
+        <contact name="left_foot_contact"  geom1="floor" subtree2="ankle_l_v1" data="found" num="1" reduce="mindist"/>
+        <contact name="right_foot_contact" geom1="floor" subtree2="ankle_r_v1" data="found" num="1" reduce="mindist"/>
+        <!-- Self-collision: any contact internal to the robot (trunk_base subtree vs
+             itself), mirrors the source self_collision sensor. Penalised by
+             self_collision_cost. -->
+        <contact name="self_collision" subtree1="trunk_base" subtree2="trunk_base" data="found" num="1" reduce="mindist"/>
+    </sensor>
     <keyframe>
         <key name="INIT" qpos="
         0 0 0.12 1 0 0 0 

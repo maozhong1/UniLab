@@ -101,6 +101,8 @@ class MicroduckSensor(LocomotionSensor):
     # gyro in body frame (base_ang_vel obs); velocimeter = local linvel (critic).
     gyro: str = "imu_ang_vel"
     local_linvel: str = "imu_lin_vel"
+    # whole-body angular momentum (subtreeangmom), reward-only (roller stride).
+    root_angmom: str = "root_angmom"
     # Foot frame/contact sensors (reward-only, NOT in the 61D obs). Present on the
     # walk/groundcontact models; only tasks with a foot-gait reward read them (the
     # base env never does, so models without contact sensors still load).
@@ -110,6 +112,11 @@ class MicroduckSensor(LocomotionSensor):
     right_foot_vel: str = "right_foot_vel"
     left_foot_contact: str = "left_foot_contact"
     right_foot_contact: str = "right_foot_contact"
+    # Roller-only extras (present on the rollers model): foot-site orientation for
+    # the feet_flat tilt penalty, and a whole-robot self-collision contact scalar.
+    left_foot_quat: str = "left_foot_quat"
+    right_foot_quat: str = "right_foot_quat"
+    self_collision: str = "self_collision"
 
 
 @dataclass

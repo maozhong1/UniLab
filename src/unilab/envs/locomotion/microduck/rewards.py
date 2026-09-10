@@ -269,3 +269,189 @@ def feet_clearance(
     """
     err = np.square((foot_z - ground_z) - target)  # (N, 2)
     return np.asarray(np.sum(err * foot_speed_xy, axis=1), dtype=get_global_dtype())
+
+
+# ── roller stride / swizzle rewards (ported 1:1 from microduck_rl mdp.py) ───────
+# The stride gait is CLOCK-FREE: it reads REAL per-foot air/contact times (env
+# timers), never a gait-phase clock (that path failed in velocity — see port
+# plan). Env fetches sensor/wheel/torque arrays and passes them in; funcs stay
+# pure. Sign convention: rewards ≥0 (positive weight), penalties ≥0 (negative
+# weight); a few (single_support, com_height_target, leg_symmetry) are signed.
+
+
+def _dt() -> type:
+    return get_global_dtype()
+
+
+def _cmd(ctx: RewardContext) -> np.ndarray:
+    return ctx.info["commands"]
+
+
+def _forward_gate(ctx: RewardContext, v_ref: float) -> np.ndarray | None:
+    """0→1 ramp in body forward speed; None when disabled (v_ref<=0)."""
+    if v_ref <= 0.0:
+        return None
+    v = ctx.linvel[:, 0]
+    return np.asarray(np.clip(np.clip(v, 0.0, None) / v_ref, None, 1.0), dtype=_dt())
+
+
+def wheel_speed_reward(
+    ctx: RewardContext,
+    forward_omega: np.ndarray,
+    vel_scale: float,
+    wheel_radius: float = 0.0175,
+    bidirectional: bool = False,
+) -> np.ndarray:
+    """Reward wheel spin in the commanded direction (tanh-saturated). Sole task
+    reward; ``forward_omega`` is the mean of the 4 wheel dof velocities."""
+    cmd_x = _cmd(ctx)[:, 0]
+    omega_scale = vel_scale / wheel_radius
+    if bidirectional:
+        aligned = np.sign(cmd_x) * forward_omega
+        out = np.abs(cmd_x) * np.tanh(np.clip(aligned, 0.0, None) / omega_scale)
+    else:
+        out = np.clip(cmd_x, 0.0, None) * np.tanh(np.clip(forward_omega, 0.0, None) / omega_scale)
+    return np.asarray(out, dtype=_dt())
+
+
+def braking_reward(ctx: RewardContext, vel_std: float = 0.3) -> np.ndarray:
+    """Reward stopping when cmd_x<0; silent when cmd_x>=0."""
+    cmd_x = _cmd(ctx)[:, 0]
+    fwd = ctx.linvel[:, 0]
+    stopped = np.exp(-np.square(np.clip(fwd, 0.0, None)) / (vel_std**2))
+    return np.asarray(np.clip(-cmd_x, 0.0, None) * stopped, dtype=_dt())
+
+
+def skating_air_time_reward(
+    ctx: RewardContext,
+    air_time: np.ndarray,
+    threshold_min: float,
+    threshold_max: float,
+    vel_gate_ref: float,
+) -> np.ndarray:
+    """Reward each foot's air time inside [min,max] while pushing forward."""
+    in_range = (air_time > threshold_min) & (air_time < threshold_max)
+    reward = np.sum(in_range.astype(_dt()), axis=1) * np.clip(_cmd(ctx)[:, 0], 0.0, None)
+    gate = _forward_gate(ctx, vel_gate_ref)
+    if gate is not None:
+        reward = reward * gate
+    return np.asarray(reward, dtype=_dt())
+
+
+def single_support_reward(
+    ctx: RewardContext,
+    contact: np.ndarray,
+    vel_gate_ref: float,
+    double_penalty: float = 0.25,
+) -> np.ndarray:
+    """+cmd_x·gate for exactly one blade down; −double_penalty·cmd_x for both
+    down (SIGNED → positive weight). ``contact`` is (N,2) bool."""
+    n = np.sum(contact.astype(_dt()), axis=1)
+    cmd_x = np.clip(_cmd(ctx)[:, 0], 0.0, None)
+    single_r = (n == 1).astype(_dt()) * cmd_x
+    gate = _forward_gate(ctx, vel_gate_ref)
+    if gate is not None:
+        single_r = single_r * gate
+    return np.asarray(single_r - double_penalty * (n >= 2).astype(_dt()) * cmd_x, dtype=_dt())
+
+
+def glide_reward(
+    ctx: RewardContext,
+    contact: np.ndarray,
+    leg_joint_vel_sq: np.ndarray,
+    vel_ref: float = 0.2,
+    stillness_std: float = 5.0,
+) -> np.ndarray:
+    """Reward coasting on ONE blade with quiet legs while moving forward."""
+    single = (np.sum(contact.astype(_dt()), axis=1) == 1).astype(_dt())
+    gate = _forward_gate(ctx, vel_ref)
+    if gate is None:
+        gate = np.ones((ctx.num_envs,), dtype=_dt())
+    stillness = np.exp(-leg_joint_vel_sq / (stillness_std**2))
+    active = (_cmd(ctx)[:, 0] >= 0.0).astype(_dt())
+    return np.asarray(single * gate * stillness * active, dtype=_dt())
+
+
+def gait_symmetry_penalty(ctx: RewardContext, swing_accum: np.ndarray) -> np.ndarray:
+    """Penalise cumulative L/R swing-time imbalance |L−R|/(L+R). (N,2) accum."""
+    L, R = swing_accum[:, 0], swing_accum[:, 1]
+    return np.asarray(np.abs(L - R) / (L + R + 1e-3), dtype=_dt())
+
+
+def grounded_reward(ctx: RewardContext, contact: np.ndarray) -> np.ndarray:
+    """Swizzle: reward BOTH blades down, scaled by |cmd_x| (bidirectional)."""
+    grounded = (np.sum(contact.astype(_dt()), axis=1) >= 2).astype(_dt())
+    return np.asarray(grounded * np.abs(_cmd(ctx)[:, 0]), dtype=_dt())
+
+
+def leg_symmetry_reward(ctx: RewardContext, left_q: np.ndarray, right_q: np.ndarray) -> np.ndarray:
+    """Swizzle: −mean|q_left+q_right| over matched leg pairs (SIGNED, pos weight)."""
+    return np.asarray(-np.mean(np.abs(left_q + right_q), axis=1), dtype=_dt())
+
+
+def com_height_target(ctx: RewardContext, target_min: float, target_max: float) -> np.ndarray:
+    """+1 in [min,max], −squared distance outside (SIGNED, positive weight)."""
+    h = np.nan_to_num(ctx.base_height, nan=0.0)
+    below, above = h < target_min, h > target_max
+    pen = np.square(h - target_min) * below + np.square(h - target_max) * above
+    return np.asarray((~(below | above)).astype(_dt()) - pen, dtype=_dt())
+
+
+def forward_lean_reward(ctx: RewardContext, target_pitch: float, std: float) -> np.ndarray:
+    """Reward slight forward lean (projected_gravity_x) while pushing."""
+    lean = ctx.gravity[:, 0]  # type: ignore[index]
+    push = np.clip(_cmd(ctx)[:, 0], 0.0, None)
+    return np.asarray(push * np.exp(-np.square(lean - target_pitch) / (std**2)), dtype=_dt())
+
+
+def heading_hold_reward(ctx: RewardContext, heading_err: np.ndarray, std: float) -> np.ndarray:
+    """Reward holding spawn heading; env passes the wrapped yaw error."""
+    return np.asarray(np.exp(-np.square(heading_err) / (std**2)), dtype=_dt())
+
+
+def feet_flat_penalty(ctx: RewardContext, foot_tilt_xy: np.ndarray, contact: np.ndarray) -> np.ndarray:
+    """Penalise stance-blade tilt: per-foot gravity-in-site xy², contact-gated."""
+    return np.asarray(np.sum(foot_tilt_xy * contact.astype(_dt()), axis=1), dtype=_dt())
+
+
+def neck_action_rate_l2(ctx: RewardContext) -> np.ndarray:
+    """Penalise neck/head (idx 5-8) action rate."""
+    cur = ctx.info["current_actions"][:, 5:9]
+    last = ctx.info["last_actions"][:, 5:9]
+    return np.asarray(np.sum(np.square(cur - last), axis=1), dtype=_dt())
+
+
+def variable_posture(
+    ctx: RewardContext,
+    std_standing: np.ndarray,
+    std_walking: np.ndarray,
+    std_running: np.ndarray,
+    walking_threshold: float = 0.5,
+    running_threshold: float = 1.5,
+) -> np.ndarray:
+    """Speed-regime pose reward exp(−mean(err²/std²)) over the 14 servos. std_*
+    are per-servo (14,) vectors resolved from the cfg regex dicts by the env."""
+    cmd = _cmd(ctx)
+    speed = np.linalg.norm(cmd[:, :2], axis=1) + np.abs(cmd[:, 2])
+    standing = (speed < walking_threshold)[:, None]
+    walking = ((speed >= walking_threshold) & (speed < running_threshold))[:, None]
+    running = (speed >= running_threshold)[:, None]
+    std = std_standing * standing + std_walking * walking + std_running * running
+    err_sq = np.square(ctx.dof_pos - ctx.default_angles)
+    return np.asarray(np.exp(-np.mean(err_sq / (std**2), axis=1)), dtype=_dt())
+
+
+def action_over_limit_penalty(
+    ctx: RewardContext, target: np.ndarray, joint_range: np.ndarray, overshoot: float = 0.3
+) -> np.ndarray:
+    """Penalise commanded targets beyond (hard limit + overshoot). target (N,14),
+    joint_range (14,2) hard limits."""
+    lo = joint_range[:, 0] - overshoot
+    hi = joint_range[:, 1] + overshoot
+    over = np.clip(target - hi, 0.0, None) + np.clip(lo - target, 0.0, None)
+    return np.asarray(np.sum(over, axis=1), dtype=_dt())
+
+
+def angular_momentum_penalty(ctx: RewardContext, angmom: np.ndarray) -> np.ndarray:
+    """Penalise whole-body angular momentum (root_angmom sensor, N×3)."""
+    return np.asarray(np.sum(np.square(angmom), axis=1), dtype=_dt())

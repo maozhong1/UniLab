@@ -1,0 +1,75 @@
+# @package _global_
+# Microduck roller-skate STRIDE task. Ported 1:1 from microduck_rl
+# microduck_velocity_rollers_env_cfg.py (weights unchanged — the source already
+# uses the UniLab sign convention: >=0 costs with negative weight).
+#
+# empirical_normalization: false → the exported ONNX ingests the RAW 61D obs
+# (what infer_policy.py / the real runtime feed), keeping the cross-framework
+# check normalizer-free. Deploys with `--roller`.
+training:
+  task_name: MicroduckRollers
+  sim_backend: mujoco
+algo:
+  num_envs: 4096
+  num_steps_per_env: 24
+  max_iterations: 6000
+  empirical_normalization: false
+  entropy_coef: 0.03        # roller-specific: higher exploration than the walk envs
+  experiment_name: microduck_rollers
+  obs_groups:
+    actor:
+      - actor
+  policy:
+    actor_hidden_dims: [512, 256, 128]
+    critic_hidden_dims: [512, 256, 128]
+env:
+  noise_config:
+    level: 1.0
+reward:
+  # UniLab sign convention: rewards >=0 (positive weight); penalties >=0 (negative
+  # weight). single_support / com_height_target are SIGNED with positive weight.
+  # Every Episode_Reward/<penalty> must read <=0 in the logs.
+  scales:
+    # positive-weight task / stride-shaping rewards
+    wheel_speed: 10.0          # SOLE task reward — must spin the wheels
+    braking: 1.0               # stop when cmd_x < 0
+    skating_air_time: 1.5      # lift recovery foot during push (windowed)
+    glide: 4.0                 # coast on one blade, quiet legs (commit to strokes)
+    single_support: 3.0        # exactly-one-blade-down stride (anti-swizzle); SIGNED
+    forward_lean: 1.5          # lean into the push
+    heading_hold: 1.0          # hold the spawn heading (go straight)
+    com_height_target: 2.0     # stay at skating height; SIGNED
+    upright: 2.0
+    pose: 2.0                  # speed-regime posture toward HOME (legs loosened for push)
+    # negative-weight penalties (>=0)
+    body_ang_vel: -0.05
+    angular_momentum: -0.02
+    action_rate: -1.0          # ramped to -2.0 by the S5 curriculum
+    self_collisions: -1.0
+    feet_flat: -2.0            # stance-blade flatness (contact-gated)
+    neck_action_rate: -0.5
+    joint_torques: -0.001
+    action_over_limit: -0.5    # deter over-driving a joint past its stop
+    hip_roll_neutral: -2.0     # pull hip_roll toward neutral (no splayed stance)
+    gait_symmetry: -1.0        # balance L/R leg usage
+  # kernel constants (source values; overridable)
+  upright_std: 0.2236
+  com_height_min: 0.0935
+  com_height_max: 0.1235
+  wheel_vel_scale: 0.3
+  wheel_bidirectional: false
+  braking_vel_std: 0.3
+  air_threshold_min: 0.15
+  air_threshold_max: 0.45
+  air_vel_gate_ref: 0.2
+  single_vel_gate_ref: 0.2
+  single_double_penalty: 0.25
+  glide_vel_ref: 0.2
+  glide_stillness_std: 5.0
+  forward_lean_target_pitch: 0.262
+  forward_lean_std: 0.1
+  heading_hold_std: 0.4
+  action_overshoot: 0.3
+  pose_walking_threshold: 0.01
+  pose_running_threshold: 0.5
+  foot_contact_threshold: 0.5

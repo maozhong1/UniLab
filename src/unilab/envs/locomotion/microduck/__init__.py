@@ -24,6 +24,11 @@ from unilab.envs.locomotion.microduck.velocity import (
     MicroduckVelocityFlatCfg,
     MicroduckVelocityRewardCfg,
 )
+from unilab.envs.locomotion.microduck.rollers import (
+    MicroduckRollersCfg,
+    MicroduckRollersEnv,
+    MicroduckRollersRewardCfg,
+)
 
 __all__ = [
     "ACTOR_OBS_DIM",
@@ -44,4 +49,7 @@ __all__ = [
     "MicroduckVelocityEnv",
     "MicroduckVelocityFlatCfg",
     "MicroduckVelocityRewardCfg",
+    "MicroduckRollersCfg",
+    "MicroduckRollersEnv",
+    "MicroduckRollersRewardCfg",
 ]

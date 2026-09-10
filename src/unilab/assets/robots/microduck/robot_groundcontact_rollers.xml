@@ -65,13 +65,18 @@
     <accelerometer name="imu_accel" site="imu"/>
     <subtreeangmom name="root_angmom" body="trunk_base"/>
     <!-- Foot frame sensors (reward-only, not in the 61D obs). Anchored to the
-         left_foot/right_foot sites; contact sensors live in the scene XML.
-         (Rollers scene has no *_foot_collision geoms, so it carries no foot
-         contact sensor — these frame sensors are still valid.) -->
+         left_foot/right_foot sites. Per-foot ground contact + self-collision are
+         subtree-scoped <contact> sensors in scene_rollers.xml (the blade has no
+         sole geom, so contact is the ankle-subtree tires vs floor).
+         framepos/framelinvel drive slide/clearance; framequat drives feet_flat
+         (gravity projected into the site frame → tilt penalty, exactly like the
+         source's site_quat_w path). -->
     <framepos objtype="site" objname="left_foot" name="left_foot_pos"/>
     <framelinvel objtype="site" objname="left_foot" name="left_foot_vel"/>
+    <framequat objtype="site" objname="left_foot" name="left_foot_quat"/>
     <framepos objtype="site" objname="right_foot" name="right_foot_pos"/>
     <framelinvel objtype="site" objname="right_foot" name="right_foot_vel"/>
+    <framequat objtype="site" objname="right_foot" name="right_foot_quat"/>
   </sensor>
   <!-- Additional additional.xml -->
   <default>
