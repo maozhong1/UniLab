@@ -221,6 +221,60 @@ def load_g1_from_last_pt(model: SonicG1Core, ckpt_path: str) -> SonicG1Core:
     return model
 
 
+def load_critic_from_last_pt(critic, ckpt_path: str):
+    """Warm-load the official SONIC critic from last.pt's ``value_state_dict`` into a
+    stock ``MLPModel``-style critic (``.mlp`` + ``.obs_normalizer``), avoiding a cold
+    critic at the start of warm training.
+
+    Requires the critic observation to be the official 1645-dim ``privileged_mf_hist``
+    layout (env ``critic_privileged_mf_hist=True``) so the first Linear ``(2048,1645)``
+    matches; otherwise it raises with an explicit hint.
+
+    Key remap (official -> UniLab):
+      ``critic_module.module.<i>.{weight,bias}`` -> ``mlp.<i>.{weight,bias}`` (identical i)
+      ``running_mean_std.{running_mean,running_var,count}`` -> ``obs_normalizer.{_mean,_var,count}``
+
+    NOTE (normalizer approximation): official ``RunningMeanStd`` normalizes as
+    ``clamp((x-mean)/sqrt(var+1e-5), -5, 5)`` while UniLab's ``EmpiricalNormalization``
+    uses ``(x-mean)/(sqrt(var)+1e-2)`` with no clamp. We copy mean/var/count so the
+    loaded critic starts from the official statistics; the eps/clamp difference is a
+    small residual (the normalizer keeps adapting during warm training).
+    """
+    _install_fake_import_hook()
+    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    vsd = ck["value_state_dict"]
+
+    prefix = "critic_module.module."
+    mlp_sd = {k[len(prefix):]: v for k, v in vsd.items() if k.startswith(prefix)}
+    if "0.weight" not in mlp_sd:
+        raise KeyError(f"{ckpt_path}: value_state_dict has no '{prefix}0.weight' (unexpected critic layout)")
+    ckpt_in = mlp_sd["0.weight"].shape[1]
+    have_in = critic.mlp[0].weight.shape[1]
+    if ckpt_in != have_in:
+        raise ValueError(
+            f"critic input-dim mismatch: last.pt critic expects {ckpt_in} but the UniLab "
+            f"critic obs is {have_in}. Set env.critic_privileged_mf_hist=true to build the "
+            f"official 1645-d privileged_mf_hist critic obs before warm-loading the critic."
+        )
+    critic.mlp.load_state_dict(mlp_sd, strict=True)
+
+    norm = getattr(critic, "obs_normalizer", None)
+    if (
+        norm is not None
+        and hasattr(norm, "_mean")
+        and "running_mean_std.running_mean" in vsd
+    ):
+        with torch.no_grad():
+            mean = vsd["running_mean_std.running_mean"].reshape(1, -1).to(norm._mean.dtype)
+            var = vsd["running_mean_std.running_var"].reshape(1, -1).to(norm._var.dtype)
+            norm._mean.copy_(mean)
+            norm._var.copy_(var)
+            norm._std.copy_(torch.sqrt(var))  # EmpiricalNormalization maintains _std=sqrt(_var)
+            if "running_mean_std.count" in vsd:
+                norm.count.copy_(vsd["running_mean_std.count"].reshape(()).to(norm.count.dtype))
+    return critic
+
+
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     import argparse

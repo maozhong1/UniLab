@@ -123,6 +123,28 @@ def _pack_sonic_encoder_command(joint_pos: np.ndarray, joint_vel: np.ndarray) ->
     ).reshape(rows, future_frames, _CMD_PER_FRAME * num_joints)
 
 
+# Official SONIC ``privileged_mf_hist`` critic tracks these 14 bodies (order fixed by
+# gear_sonic config/manager_env/commands/terms/motion.yaml body_names). This equals the
+# default MotionTrackingCfg.body_names order, so robot_body_pos_w is already aligned; we
+# still map by name so a reordered body_names can't silently corrupt the loaded critic.
+_CRITIC_BODY_NAMES: tuple[str, ...] = (
+    "pelvis",
+    "left_hip_roll_link",
+    "left_knee_link",
+    "left_ankle_roll_link",
+    "right_hip_roll_link",
+    "right_knee_link",
+    "right_ankle_roll_link",
+    "torso_link",
+    "left_shoulder_roll_link",
+    "left_elbow_link",
+    "left_wrist_yaw_link",
+    "right_shoulder_roll_link",
+    "right_elbow_link",
+    "right_wrist_yaw_link",
+)
+
+
 @registry.envcfg("G1SonicMotionTracking")
 @dataclass
 class G1SonicMotionTrackingCfg(MotionTrackingCfg):
@@ -187,6 +209,16 @@ class G1SonicMotionTrackingCfg(MotionTrackingCfg):
     # body state (more than the actor) AND the future reference (like the actor). Pair
     # with a bigger SiLU critic MLP in sonic.yaml. Set False to restore the stock 286.
     critic_include_future: bool = True
+    # Byte-exact official critic obs: rebuild "critic" as the 1645-dim privileged_mf_hist
+    # value observation so last.pt's official critic (value_state_dict, first layer
+    # (2048,1645)) can be warm-loaded -> no cold critic. Layout (verified vs gear_sonic):
+    #   command_multi_future(580) + motion_anchor_pos_b(3) + motion_anchor_ori_b(6)
+    #   + body_pos(14x3=42) + body_ori(14x6=84)                              -> 715
+    #   + hist(10) of [base_lin_vel(3), base_ang_vel(3), joint_pos_rel(29),
+    #                  joint_vel(29), last_action(29)] oldest->newest        -> 930
+    # 29-wide blocks use IsaacLab joint order (via _jperm); base 3-vectors unpermuted.
+    # When True this REPLACES the 926-d Level-A critic (critic_include_future is ignored).
+    critic_privileged_mf_hist: bool = False
 
 
 @registry.env("G1SonicMotionTracking", sim_backend="mujoco")
@@ -251,11 +283,38 @@ class G1SonicMotionTrackingEnv(MotionTrackingEnv):
             "gravity_dir": np.zeros((num_envs, H, 3), dtype=dtype),
         }
 
+        # ---- byte-exact official 1645 critic (privileged_mf_hist) ----------
+        # 14 tracked bodies, mapped by name so a reordered body_names can't corrupt the
+        # loaded critic. body_pos(3)+body_ori(6) per body -> 14*9 = 126.
+        self._critic_body_indices = np.asarray(
+            [cfg.body_names.index(name) for name in _CRITIC_BODY_NAMES], dtype=np.intp
+        )
+        nb = self._critic_body_indices.size
+        # 580 command + 3 anchor_pos + 6 anchor_ori + 9*nb body + (6+3n)*H history
+        self._critic_mf_hist_dim = (
+            _CMD_PER_FRAME * n * self._F + 3 + _ANCHOR_ORI6 + 9 * nb + (6 + 3 * n) * self._H
+        )
+        # separate critic history ring (oldest-first): base_lin_vel + base_ang_vel(gyro)
+        # + joint_pos_rel + joint_vel + last_actions. Distinct from the actor's _hist
+        # (which has gravity_dir and no base_lin_vel), and in the official term order.
+        self._chist: dict[str, np.ndarray] = {}
+        if cfg.critic_privileged_mf_hist:
+            self._chist = {
+                "base_lin_vel": np.zeros((num_envs, H, 3), dtype=dtype),
+                "base_ang_vel": np.zeros((num_envs, H, 3), dtype=dtype),
+                "joint_pos_rel": np.zeros((num_envs, H, n), dtype=dtype),
+                "joint_vel": np.zeros((num_envs, H, n), dtype=dtype),
+                "last_actions": np.zeros((num_envs, H, n), dtype=dtype),
+            }
+
     # obs_groups_spec reports the sonic actor width; the stock 160-dim actor built
     # by super()._compute_obs is discarded (we override "obs"). _actor_obs_dim is
     # left at the stock value so super's internal allocation stays correct.
     @property
     def obs_groups_spec(self) -> dict[str, int]:
+        if self._cfg.critic_privileged_mf_hist:
+            # byte-exact official value obs (1645) — supersedes the 926-d Level-A critic
+            return {"obs": self._sonic_actor_dim, "critic": self._critic_mf_hist_dim}
         critic_width = self._critic_obs_width
         if self._cfg.critic_include_future:
             critic_width += self._enc_dim  # +640 multi-future command+anchor
@@ -381,6 +440,128 @@ class G1SonicMotionTrackingEnv(MotionTrackingEnv):
         sel = slice(None) if env_ids is None else env_ids
         for key, val in components.items():
             self._hist[key][sel, :] = val[:, None, :]
+
+    def _push_critic_history(
+        self, env_ids: np.ndarray | None, components: dict[str, np.ndarray]
+    ) -> None:
+        sel = slice(None) if env_ids is None else env_ids
+        for key, val in components.items():
+            buf = self._chist[key]
+            buf[sel, :-1] = buf[sel, 1:]
+            buf[sel, -1] = val
+
+    def _fill_critic_history(
+        self, env_ids: np.ndarray | None, components: dict[str, np.ndarray]
+    ) -> None:
+        sel = slice(None) if env_ids is None else env_ids
+        for key, val in components.items():
+            self._chist[key][sel, :] = val[:, None, :]
+
+    def _proprio_core(
+        self, info: dict, dof_pos: np.ndarray, dof_vel: np.ndarray, gyro: np.ndarray
+    ) -> dict[str, np.ndarray]:
+        """IsaacLab-order (gyro, joint_pos_rel, dof_vel, last_actions) shared by the
+        actor proprio and the critic history. Mirrors the inline block in
+        ``_build_sonic_actor`` — keep the two in sync."""
+        dtype = get_global_dtype()
+        n = self._num_action
+        R = dof_pos.shape[0]
+        bias = info.get("default_dof_pos_bias")
+        effective_default = self.default_angles + bias if bias is not None else self.default_angles
+        joint_pos_rel = np.asarray(dof_pos - effective_default, dtype=dtype)
+        last_actions = info.get("current_actions")
+        if not isinstance(last_actions, np.ndarray):
+            last_actions = np.zeros((R, n), dtype=dtype)
+        last_actions = np.asarray(last_actions, dtype=dtype)
+        dof_vel = np.asarray(dof_vel, dtype=dtype)
+        jp_perm = self._jperm
+        if jp_perm.shape[0] == n:
+            joint_pos_rel = joint_pos_rel[:, jp_perm]
+            dof_vel = dof_vel[:, jp_perm]
+            last_actions = last_actions[:, jp_perm]
+        return {
+            "gyro": np.asarray(gyro, dtype=dtype),
+            "joint_pos_rel": joint_pos_rel,
+            "dof_vel": dof_vel,
+            "last_actions": last_actions,
+        }
+
+    def _build_sonic_critic(
+        self,
+        info: dict,
+        motion_data: Any,
+        linvel: np.ndarray,
+        gyro: np.ndarray,
+        dof_pos: np.ndarray,
+        dof_vel: np.ndarray,
+        robot_body_pos_w: np.ndarray,
+        robot_body_quat_w: np.ndarray,
+    ) -> np.ndarray:
+        """Byte-exact official ``privileged_mf_hist`` value observation (1645)."""
+        dtype = get_global_dtype()
+        R = dof_pos.shape[0]
+        ai = self.anchor_body_idx
+        env_ids = info.get("env_ids")
+        is_reset = env_ids is not None
+
+        # ---- 715 future/privileged block ---------------------------------
+        # command_multi_future (580) = [all F pos-frames (29 each)] ++ [all F vel-frames].
+        # jp,jv from _gather_future are already MuJoCo->IsaacLab permuted, near->far.
+        jp, jv, _, _ = self._gather_future(env_ids)  # (R,F,n)
+        command_mf = np.concatenate([jp.reshape(R, -1), jv.reshape(R, -1)], axis=1)
+
+        # motion_anchor_pos_b(3) + motion_anchor_ori_b(6): current ref-motion anchor in
+        # robot pelvis frame (single frame). src=robot pelvis, tgt=ref-motion anchor.
+        anchor_pos = np.empty((R, 3), dtype=dtype)
+        anchor_ori6 = np.empty((R, _ANCHOR_ORI6), dtype=dtype)
+        np_write_relative_anchor_transform_pos_rot6d(
+            robot_body_pos_w[:, ai],
+            robot_body_quat_w[:, ai],
+            motion_data.body_pos_w[:, ai],
+            motion_data.body_quat_w[:, ai],
+            anchor_pos,
+            anchor_ori6,
+        )
+
+        # body_pos(14x3) + body_ori(14x6): robot's own tracked bodies in pelvis frame.
+        bidx = self._critic_body_indices
+        nb = bidx.size
+        src_pos = np.repeat(robot_body_pos_w[:, ai], nb, axis=0)  # (R*nb,3)
+        src_quat = np.repeat(robot_body_quat_w[:, ai], nb, axis=0)
+        tgt_pos = robot_body_pos_w[:, bidx].reshape(R * nb, 3)
+        tgt_quat = robot_body_quat_w[:, bidx].reshape(R * nb, 4)
+        body_pos_out = np.empty((R * nb, 3), dtype=dtype)
+        body_ori_out = np.empty((R * nb, _ANCHOR_ORI6), dtype=dtype)
+        np_write_relative_anchor_transform_pos_rot6d(
+            src_pos, src_quat, tgt_pos, tgt_quat, body_pos_out, body_ori_out
+        )
+        body_pos = body_pos_out.reshape(R, nb * 3)
+        body_ori = body_ori_out.reshape(R, nb * _ANCHOR_ORI6)
+
+        # ---- 930 history block (oldest->newest, official term order) ------
+        core = self._proprio_core(info, dof_pos, dof_vel, gyro)
+        components = {
+            "base_lin_vel": np.asarray(linvel, dtype=dtype),  # privileged, base frame
+            "base_ang_vel": core["gyro"],                     # pelvis gyro, base frame
+            "joint_pos_rel": core["joint_pos_rel"],
+            "joint_vel": core["dof_vel"],
+            "last_actions": core["last_actions"],
+        }
+        if is_reset:
+            self._fill_critic_history(env_ids, components)
+        else:
+            self._push_critic_history(env_ids, components)
+        sel = slice(None) if env_ids is None else env_ids
+        hist_terms = [
+            self._chist[k][sel].reshape(R, -1)
+            for k in ("base_lin_vel", "base_ang_vel", "joint_pos_rel", "joint_vel", "last_actions")
+        ]
+
+        return np.concatenate(
+            [command_mf, anchor_pos, anchor_ori6, body_pos, body_ori, *hist_terms],
+            axis=1,
+            dtype=dtype,
+        )
 
     def apply_action(self, actions: np.ndarray, state: Any) -> np.ndarray:
         """Remap the sonic decoder's IsaacLab-order action to MuJoCo order before the
@@ -529,6 +710,13 @@ class G1SonicMotionTrackingEnv(MotionTrackingEnv):
         actor = self._build_sonic_actor(
             info, dof_pos, dof_vel, gyro, robot_body_pos_w, robot_body_quat_w
         )
+        if self._cfg.critic_privileged_mf_hist:
+            # byte-exact official 1645 value obs (enables warm-loading last.pt's critic)
+            critic = self._build_sonic_critic(
+                info, motion_data, linvel, gyro, dof_pos, dof_vel,
+                robot_body_pos_w, robot_body_quat_w,
+            )
+            return {"obs": actor, "critic": critic}
         critic = base["critic"]
         if self._cfg.critic_include_future:
             # actor[:, :enc_dim] IS the 640-d encoder input (multi-future command+anchor);

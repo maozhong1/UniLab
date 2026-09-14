@@ -3,17 +3,19 @@
 Public API:
   - ``SonicG1Core``      : encoder(+FSQ)+decoder core network (loads sonic last.pt).
   - ``SonicG1ActorModel``: RSL-RL actor wrapper (plug via class_name in the PPO conf).
-
-The critic stays a stock ``rsl_rl.models.MLPModel`` (configured in YAML); no custom
-critic is needed because the value net should not use the quantized FSQ backbone.
+  - ``SonicCriticModel`` : stock MLP critic + optional warm-load of last.pt's official
+    critic (value_state_dict) — plug via class_name; needs the 1645-d critic obs.
 """
-from .core import FSQFallback, SonicG1Core, load_g1_from_last_pt, make_fsq
+from .core import FSQFallback, SonicG1Core, load_critic_from_last_pt, load_g1_from_last_pt, make_fsq
+from .critic import SonicCriticModel
 from .models import SonicG1ActorModel
 
 __all__ = [
     "SonicG1Core",
     "SonicG1ActorModel",
+    "SonicCriticModel",
     "load_g1_from_last_pt",
+    "load_critic_from_last_pt",
     "make_fsq",
     "FSQFallback",
 ]
