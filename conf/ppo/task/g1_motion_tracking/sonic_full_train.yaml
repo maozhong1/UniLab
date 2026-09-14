@@ -47,10 +47,13 @@ algo:
     # [2048,2048,1024,1024,512,512] as the XPU-affordable step up from the 4-layer 1024 net
     # (that 4-layer net could not fit the value fn over 1000 diverse clips -> noisy
     # advantages -> non-convergence). obs_normalization=RunningMeanStd, as official.
-    # NOTE: the 286 privileged body-state block is SINGLE-FRAME here; official adds hist=10
-    # to it (privileged_mf_hist) -- that needs an env change, deferred. Shrink back to
-    # [512,256,128]/elu (+critic_include_future=false) to A/B.
-    class_name: rsl_rl.models.MLPModel
+    # The byte-exact official 1645-d privileged_mf_hist critic obs is now IMPLEMENTED
+    # (see tracking_sonic.py). To use it for from-scratch too, set below:
+    #   env.critic_privileged_mf_hist: true   (obs -> 1645, joint blocks in MuJoCo order
+    #   here since mujoco_to_isaaclab_perm=false; self-consistent for a fresh critic).
+    # Left OFF by default to keep the in-flight 926-d Level-A from-scratch runs stable.
+    # SonicCriticModel == stock MLPModel when pretrained_ckpt is unset (fresh critic).
+    class_name: unilab.algos.torch.sonic:SonicCriticModel
     hidden_dims: [2048, 2048, 1024, 1024, 512, 512]
     activation: swish   # rsl_rl key for SiLU (official critic activation)
     obs_normalization: true

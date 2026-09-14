@@ -44,15 +44,17 @@ algo:
       init_std: 0.05         # mirror sonic's trained std (small exploration for warm-start)
       std_type: scalar
   critic:
-    # Level-A critic (matches sonic.yaml): consumes 926 = 286 privileged body state +
-    # 640 future reference (env.critic_include_future below). Bigger SiLU MLP toward
-    # SONIC's official critic. Safe for warm: the critic is training-only, never
-    # deployed, and is NOT loaded from last.pt (load_g1_from_last_pt is actor-only), so
-    # it starts fresh regardless -- CRITIC_WARMUP handles the burn-in.
-    class_name: rsl_rl.models.MLPModel
-    hidden_dims: [1024, 1024, 512, 512]
-    activation: swish   # rsl_rl key for SiLU
+    # Byte-exact official critic, WARM-LOADED from last.pt's value_state_dict so there is
+    # NO cold critic. Requires env.critic_privileged_mf_hist=true (1645-d value obs) below.
+    # Arch = official: MLP [2048,2048,1024,1024,512,512] SiLU + RunningMeanStd(obs_norm).
+    # SonicCriticModel = stock MLPModel + a pretrained_ckpt hook (mirrors the actor).
+    # Revert to a fresh critic on the CLI: algo.critic.pretrained_ckpt=null (and optionally
+    # +algo.algorithm.critic_warmup_iters=... for the burn-in path).
+    class_name: unilab.algos.torch.sonic:SonicCriticModel
+    hidden_dims: [2048, 2048, 1024, 1024, 512, 512]
+    activation: swish   # rsl_rl key for SiLU (official critic activation)
     obs_normalization: true
+    pretrained_ckpt: /home/maozhong/work/sonic_vla_infer/GR00T-WholeBodyControl-ov/sonic_release/last.pt
   algorithm:
     entropy_coef: 0.005
 # Warm-start needs the action-side IsaacLab→MuJoCo remap so the pretrained decoder
@@ -61,11 +63,12 @@ algo:
 env:
   sim_dt: 0.005
   action_output_isaaclab_to_mujoco: true
-  # Level-A: feed the value net the actor's 640-d multi-future command+anchor so it
-  # sees the reference horizon (default is already true; set explicitly here so this
-  # warm config is self-documenting and robust to future default changes). Pairs with
-  # the 926-input SiLU critic above.
-  critic_include_future: true
+  # Byte-exact official value obs: rebuild "critic" as the 1645-d privileged_mf_hist
+  # vector so last.pt's official critic (value_state_dict, first layer (2048,1645)) can be
+  # warm-loaded -> no cold critic. Supersedes the 926-d Level-A path (critic_include_future
+  # is ignored when this is on). Joint blocks use IsaacLab order via the actor's
+  # mujoco_to_isaaclab_perm=true (already set for warm), matching the loaded critic.
+  critic_privileged_mf_hist: true
 reward:
   scales:
     motion_global_root_pos: 0.5
