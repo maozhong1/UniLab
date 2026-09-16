@@ -8,11 +8,12 @@ Public API:
 """
 from .core import FSQFallback, SonicG1Core, load_critic_from_last_pt, load_g1_from_last_pt, make_fsq
 from .critic import SonicCriticModel
-from .models import SonicG1ActorModel
+from .models import SonicG1ActorModel, SonicH2ActorModel
 
 __all__ = [
     "SonicG1Core",
     "SonicG1ActorModel",
+    "SonicH2ActorModel",
     "SonicCriticModel",
     "load_g1_from_last_pt",
     "load_critic_from_last_pt",
