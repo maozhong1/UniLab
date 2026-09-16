@@ -1,0 +1,55 @@
+<mujoco model="h2 flat scene">
+  <include file="h2.xml"/>
+
+  <statistic center="1 -0.8 1.1" extent=".35"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.1 0.1 0.1" specular="0.9 0.9 0.9"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="140" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+  </asset>
+
+  <worldbody>
+    <light pos="1 0 3.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+  </worldbody>
+
+  <!-- Default standing pose from gear_sonic h2.py init_state (pelvis 1.04 m).
+       qpos = root(pos 3 + quat 4) ++ 31 joint angles in MJCF actuator/tree order:
+         L leg: hip_pitch, hip_roll, hip_yaw, knee, ankle_roll, ankle_pitch
+         R leg: (same)
+         waist: yaw, roll, pitch
+         head:  pitch, yaw
+         L arm: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw
+         R arm: (same)
+       ctrl (31) = the same joint angles (position servos hold the stand pose). -->
+  <keyframe>
+    <key name="stand"
+      qpos="
+      0 0 1.04
+      1 0 0 0
+      -0.312 0.0 0.0 0.669 0.0 -0.363
+      -0.312 0.0 0.0 0.669 0.0 -0.363
+      0.0 0.0 0.0
+      0.0 0.0
+      0.2  0.2 0.0 0.6 0.0 0.0 0.0
+      0.2 -0.2 0.0 0.6 0.0 0.0 0.0
+      "
+      ctrl="
+      -0.312 0.0 0.0 0.669 0.0 -0.363
+      -0.312 0.0 0.0 0.669 0.0 -0.363
+      0.0 0.0 0.0
+      0.0 0.0
+      0.2  0.2 0.0 0.6 0.0 0.0 0.0
+      0.2 -0.2 0.0 0.6 0.0 0.0 0.0
+      "/>
+  </keyframe>
+
+</mujoco>

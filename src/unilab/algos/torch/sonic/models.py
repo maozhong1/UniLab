@@ -96,7 +96,16 @@ class SonicG1ActorModel(nn.Module):
         self.obs_dim = self.enc_dim + self.proprio_dim
         self.action_dim = int(output_dim)
 
-        self.core = SonicG1Core(with_kin_aux=with_kin_aux, use_fsq=use_fsq)
+        # Forward the obs/action widths into the core so a non-G1 robot (e.g. H2,
+        # enc 680 / proprio 990 / action 31) builds a correctly-sized network. Defaults
+        # keep G1 (640/930/29) byte-identical.
+        self.core = SonicG1Core(
+            with_kin_aux=with_kin_aux,
+            use_fsq=use_fsq,
+            enc_input_dim=self.enc_dim,
+            proprio_dim=self.proprio_dim,
+            action_dim=self.action_dim,
+        )
         if pretrained_ckpt:
             load_g1_from_last_pt(self.core, pretrained_ckpt)
         self.freeze_encoder = bool(freeze_encoder)
@@ -227,3 +236,20 @@ class SonicG1ActorModel(nn.Module):
     def as_onnx(self, verbose: bool = False) -> nn.Module:
         del verbose
         return self._export_module()
+
+
+class SonicH2ActorModel(SonicG1ActorModel):
+    """SONIC actor for the Unitree H2 (31 DOF).
+
+    Identical wiring to ``SonicG1ActorModel`` but with H2's obs/action widths as
+    defaults: encoder input 680 = (2·31+6)·10, proprio 990 = (3+3·31+3)·10, so the
+    single combined actor stream is 1670 and the decoder emits 31 actions. There is no
+    ``last.pt`` in H2 joint layout, so H2 always trains from scratch (leave
+    ``pretrained_ckpt`` unset). ``output_dim`` (=31) is supplied by the PPO runner from
+    the env action space; ``enc_dim``/``proprio_dim`` may still be overridden in YAML.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("enc_dim", 680)
+        kwargs.setdefault("proprio_dim", 990)
+        super().__init__(*args, **kwargs)

@@ -104,16 +104,39 @@ class SonicG1Core(nn.Module):
     PROPRIO_DIM = 930
     ACTION_DIM = 29
 
-    def __init__(self, with_kin_aux: bool = False, use_fsq: bool = True) -> None:
+    def __init__(
+        self,
+        with_kin_aux: bool = False,
+        use_fsq: bool = True,
+        enc_input_dim: int | None = None,
+        proprio_dim: int | None = None,
+        action_dim: int | None = None,
+    ) -> None:
+        """Encoder(+FSQ)+decoder core.
+
+        ``enc_input_dim`` / ``proprio_dim`` / ``action_dim`` default to the G1 values
+        (640 / 930 / 29) so existing G1 training is byte-identical. Pass the H2 widths
+        (680 / 990 / 31) for the 31-DOF port. Only the first encoder layer, the decoder
+        input (token64 + proprio) and output (=action) layers, the kin-aux output, and
+        the std shape depend on these — the hidden widths and FSQ (2×32, token 64) are
+        robot-independent.
+        """
         super().__init__()
         self.use_fsq = bool(use_fsq)
-        self.encoder = build_mlp(self.G1_ENC_DIMS)  # 640 -> 64
+        enc_in = int(enc_input_dim) if enc_input_dim is not None else self.ENC_INPUT_DIM
+        prop = int(proprio_dim) if proprio_dim is not None else self.PROPRIO_DIM
+        act = int(action_dim) if action_dim is not None else self.ACTION_DIM
+        self.enc_input_dim, self.proprio_dim, self.action_dim = enc_in, prop, act
+        enc_dims = [enc_in, *self.G1_ENC_DIMS[1:]]  # swap input, keep hidden -> 64
+        dyn_dims = [self.TOKEN_DIM + prop, *self.G1_DYN_DIMS[1:-1], act]  # token+proprio -> act
+        kin_dims = [*self.G1_KIN_DIMS[:-1], enc_in]  # token -> enc_input (aux recon)
+        self.encoder = build_mlp(enc_dims)  # enc_in -> 64
         self.fsq, self.fsq_is_official = make_fsq([self.FSQ_LEVELS] * self.FSQ_DIM_PER_TOKEN)
-        self.decoder = build_mlp(self.G1_DYN_DIMS)  # 994 -> 29
-        self.kin = build_mlp(self.G1_KIN_DIMS) if with_kin_aux else None  # 64 -> 640 (aux)
+        self.decoder = build_mlp(dyn_dims)  # token+proprio -> act
+        self.kin = build_mlp(kin_dims) if with_kin_aux else None  # 64 -> enc_in (aux)
         # informational: sonic's own action std (used only if you want to seed the
         # RSL-RL GaussianDistribution). The RL policy std is owned by the distribution.
-        self.log_std = nn.Parameter(torch.full((self.ACTION_DIM,), 0.05).log())
+        self.log_std = nn.Parameter(torch.full((act,), 0.05).log())
 
     def encode(self, obs_g1: torch.Tensor) -> torch.Tensor:
         """(B, 640) -> token (B, 64). FSQ-quantized unless ``use_fsq`` is False."""
