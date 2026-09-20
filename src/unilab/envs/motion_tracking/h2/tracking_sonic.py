@@ -95,9 +95,19 @@ class SonicRewardConfig(RewardConfig):
             **RewardConfig().scales,
             "motion_local_points": 2.0,
             "undesired_contacts": -0.1,
+            # Foot-slip / foot-yaw penalties. H2's single foot-mesh contact has no
+            # torsional friction, so a support foot can free-spin on turns and wreck
+            # motion_body_ang_vel tracking. These shape the *policy* (not the contact
+            # model), so train and deploy stay on the identical h2.xml. Default OFF;
+            # enable per-run via reward.scales.feet_slide / feet_yaw (negative=penalty).
+            "feet_slide": 0.0,
+            "feet_yaw": 0.0,
         }
     )
     std_local_points: float = 0.1
+    # Robot foot world-z below this (flat ground) counts as "in contact" for the
+    # feet_slide / feet_yaw gates. Calibrate to H2 ankle_roll_link stance height.
+    feet_contact_height: float = 0.15
 
 
 @registry.envcfg("H2SonicMotionTracking")
@@ -170,6 +180,17 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
         )
         self._strict_done = np.empty((num_envs,), dtype=bool)
         self._strict_ee_mask = np.empty((num_envs, self.ee_body_indices.size), dtype=bool)
+
+        # feet_slide / feet_yaw penalty scratch (zero-alloc hot path). Contact is
+        # proxied by robot foot world-z < feet_contact_height (see SonicRewardConfig).
+        _fdt = get_global_dtype()
+        _nf = self._strict_foot_indices.size
+        self._foot_xy_sq = np.empty((num_envs, _nf, 2), dtype=_fdt)
+        self._foot_perfoot = np.empty((num_envs, _nf), dtype=_fdt)
+        self._foot_gate = np.empty((num_envs, _nf), dtype=bool)
+        self._foot_penalty_slide = np.empty((num_envs,), dtype=_fdt)
+        self._foot_penalty_yaw = np.empty((num_envs,), dtype=_fdt)
+
         n = self._num_action
         self._F = int(cfg.num_future_frames)
         self._stride = int(cfg.future_stride)
@@ -402,6 +423,49 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
     def _init_reward_functions(self) -> None:
         super()._init_reward_functions()
         self._reward_fns["motion_local_points"] = self._reward_motion_local_points
+        self._reward_fns["feet_slide"] = self._reward_feet_slide
+        self._reward_fns["feet_yaw"] = self._reward_feet_yaw
+
+    def _reward_feet_slide(self, ctx: Any) -> np.ndarray:
+        """Penalize horizontal foot velocity while the foot is near the ground.
+
+        Contact is proxied by robot foot world-z < ``feet_contact_height`` (flat
+        ground; mirrors ``undesired_contacts``' height proxy, no contact sensor
+        needed). Returns the per-foot-mean horizontal speed² of *contacting* feet;
+        the negative ``feet_slide`` scale turns it into a slip penalty. Geometry-
+        agnostic — shapes the policy, not the contact model, so train == deploy.
+        """
+        idx = self._strict_foot_indices
+        np.square(ctx.robot_body_lin_vel_w[:, idx, :2], out=self._foot_xy_sq)
+        np.sum(self._foot_xy_sq, axis=2, out=self._foot_perfoot)
+        np.less(
+            ctx.robot_body_pos_w[:, idx, 2],
+            self._cfg.reward_config.feet_contact_height,
+            out=self._foot_gate,
+        )
+        self._foot_perfoot *= self._foot_gate
+        np.sum(self._foot_perfoot, axis=1, out=self._foot_penalty_slide)
+        self._foot_penalty_slide /= idx.size
+        return self._foot_penalty_slide
+
+    def _reward_feet_yaw(self, ctx: Any) -> np.ndarray:
+        """Penalize foot yaw-rate (spin about vertical) while near the ground.
+
+        Same contact-height proxy as :meth:`_reward_feet_slide`. Directly targets
+        the ``motion_body_ang_vel`` failure mode where H2's single-mesh foot, having
+        no torsional friction, free-spins during single-support turns.
+        """
+        idx = self._strict_foot_indices
+        np.square(ctx.robot_body_ang_vel_w[:, idx, 2], out=self._foot_perfoot)
+        np.less(
+            ctx.robot_body_pos_w[:, idx, 2],
+            self._cfg.reward_config.feet_contact_height,
+            out=self._foot_gate,
+        )
+        self._foot_perfoot *= self._foot_gate
+        np.sum(self._foot_perfoot, axis=1, out=self._foot_penalty_yaw)
+        self._foot_penalty_yaw /= idx.size
+        return self._foot_penalty_yaw
 
     def _reward_motion_local_points(self, ctx: Any) -> np.ndarray:
         ref_pos = ctx.motion_data.body_pos_w[:, self._strict_local_point_indices]

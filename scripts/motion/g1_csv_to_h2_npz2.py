@@ -188,7 +188,11 @@ def _build_targets(
     pelvis_xy = g1_pos[_ANCHOR_BODY][:2]
     tgt_pos: dict[str, np.ndarray] = {}
     for name, p in g1_pos.items():
-        xy = pelvis_xy * h_scale + (p[:2] - pelvis_xy) * h_scale
+        # Keep the global pelvis path at G1 scale; grow only the pelvis-relative offset
+        # (stance width / stride / reach) by the leg-length ratio. NOTE: writing the first
+        # term as ``pelvis_xy`` (not ``pelvis_xy * h_scale``) is load-bearing — scaling it
+        # too makes the pelvis terms cancel and uniformly magnifies the whole world path.
+        xy = pelvis_xy + (p[:2] - pelvis_xy) * h_scale
         z = (p[2] - support_z) * v_scale + foot_offset
         tgt_pos[name] = np.array([xy[0], xy[1], z], dtype=np.float64)
     tgt_quat = {name: g1_quat[name].copy() for name in _ORI_WEIGHTS}
@@ -277,6 +281,8 @@ def run_h2_ik_export(
     iters: int,
     warm_iters: int,
     debug: bool,
+    ground: bool = True,
+    ground_tol: float = 0.0,
 ) -> dict[str, float]:
     tmp_model_path, _, _ = inject_mujoco_tracking_sensors(h2_model_file)
     try:
@@ -284,6 +290,15 @@ def run_h2_ik_export(
     finally:
         Path(tmp_model_path).unlink(missing_ok=True)
     data = mujoco.MjData(model)
+
+    # Foot contact geoms (the condim mesh copies on ankle_*; contype!=0). Used by the
+    # grounding pass to project any floor penetration out of each solved frame.
+    foot_contact_geoms = {
+        g for g in range(model.ngeom)
+        if model.geom_contype[g] != 0
+        and (bn := mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[g]))
+        and "ankle" in bn
+    }
 
     inj = _map_csv_joints(model, list(loader.joint_names))       # 29 CSV joints -> H2 addrs
     readback = _hinge_joint_readback(model)                       # 31 H2 hinges, model order
@@ -318,6 +333,29 @@ def run_h2_ik_export(
         qpos_traj[i] = data.qpos.copy()
         if debug:
             err_accum += float(np.linalg.norm(tgt_pos["left_ankle_roll_link"] - data.xpos[ik.body_ids["left_ankle_roll_link"]]))
+
+    # --- grounding pass: project floor penetration out of each frame ---
+    # The IK targets the ankle-*origin* height, not the sole contact point, so a pitched
+    # foot (and IK residual) can bury the sole below z=0. Here we rigidly lift the whole
+    # body (free-joint z) per frame by the deepest foot penetration so the lowest sole
+    # sits on the floor. Lift-only (never drop) preserves genuine flight/hop phases.
+    ground_stats = {"lifted": 0, "max_pen": 0.0}
+    if ground and foot_contact_geoms:
+        for i in range(num_frames):
+            data.qpos[:] = qpos_traj[i]
+            mujoco.mj_forward(model, data)  # runs collision detection -> data.contact
+            pen = 0.0
+            for c in range(data.ncon):
+                con = data.contact[c]
+                if con.geom1 in foot_contact_geoms or con.geom2 in foot_contact_geoms:
+                    pen = min(pen, float(con.dist))  # most-negative = deepest penetration
+            if pen < -ground_tol:
+                qpos_traj[i, 2] += -pen  # rigid vertical lift so deepest sole -> z=0
+                ground_stats["lifted"] += 1
+                ground_stats["max_pen"] = min(ground_stats["max_pen"], pen)
+        if debug:
+            print(f"   grounding: lifted {ground_stats['lifted']}/{num_frames} frames, "
+                  f"max penetration fixed = {-ground_stats['max_pen']*100:.1f} cm")
 
     # --- pass 2: qvel via mj_differentiatePos, then FK readback of joints + tracking sensors ---
     dt = 1.0 / float(loader.output_fps)
@@ -386,6 +424,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warm_iters", type=int, default=60, help="DLS iterations for the first frame")
     p.add_argument("--damping", type=float, default=0.1, help="DLS damping (lambda)")
     p.add_argument("--posture_w", type=float, default=0.15, help="posture-regularization weight")
+    p.add_argument("--no_ground", action="store_true", help="disable the floor-penetration grounding pass")
+    p.add_argument("--ground_tol", type=float, default=0.0, help="allowed foot penetration (m) before lifting")
     p.add_argument("--limit", type=int, default=0, help="convert only the first N clips (0=all)")
     p.add_argument("--dry-run", action="store_true", help="validate/plan without writing NPZ")
     p.add_argument("--debug", action="store_true", help="report mean foot-target residual per clip")
@@ -431,7 +471,7 @@ def main() -> None:
                 loader, source, args.h2_model_xml, output_file,
                 h_scale=h_scale, v_scale=v_scale, foot_offset=foot_offset, damping=args.damping,
                 posture_w=args.posture_w, iters=args.ik_iters, warm_iters=args.warm_iters,
-                debug=args.debug,
+                debug=args.debug, ground=not args.no_ground, ground_tol=args.ground_tol,
             )
             if args.debug:
                 print(f"[g1_csv_to_h2_npz2] {output_file.name}: mean_foot_err={stats['mean_foot_err']:.4f} m")
