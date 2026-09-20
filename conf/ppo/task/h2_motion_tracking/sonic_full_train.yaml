@@ -53,21 +53,30 @@ env:
   mujoco_to_isaaclab_perm: false
   action_output_isaaclab_to_mujoco: false
   # loosened strict terminators for a cold policy (anneal back once ep-len climbs)
+  # P1 anneal @ iter~3k (ep-len ~295): tighten upright/height tracking to kill the
+  # forward-lean + turning drift. Tighten in steps; if ep-len collapses, back off.
   strict_foot_pos_threshold: 0.5
-  strict_anchor_ori_error_sq: 0.7
-  strict_height_threshold: 0.45
+  strict_anchor_ori_error_sq: 0.6     # 0.7 -> 0.6
+  strict_height_threshold: 0.4       # 0.45 -> 0.4
 reward:
   scales:
-    motion_global_root_pos: 0.5
-    motion_global_root_ori: 0.5
+    # P2: up-weight global root pos/ori (heading & where-it-walks) — these were the
+    # lowest-tracking terms and govern the walk-off / turning; body_pos already ~0.87.
+    motion_global_root_pos: 0.75   # 0.5 -> 0.75
+    motion_global_root_ori: 0.75   # 0.5 -> 0.75
     motion_body_pos: 1.0
     motion_body_ori: 1.0
     motion_body_lin_vel: 1.0
     motion_body_ang_vel: 1.0
     motion_joint_pos: 0.0
     motion_joint_vel: 0.0
-    action_rate_l2: -0.01
+    action_rate_l2: -0.03          # -0.01 -> -0.03  (ep-len>100, add smoothness vs jitter)
     joint_limit: -10.0
+    # Foot-slip / foot-yaw penalties (H2 single foot-mesh has no torsional friction ->
+    # support foot free-spins on turns, wrecking motion_body_ang_vel). Declared here so
+    # per-run CLI (reward.scales.feet_slide=... ) can override; default 0.0 = OFF.
+    feet_slide: 0.0
+    feet_yaw: 0.0
   std_root_pos: 0.3
   std_root_ori: 0.4
   std_body_pos: 0.3
