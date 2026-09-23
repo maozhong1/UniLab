@@ -102,12 +102,32 @@ class SonicRewardConfig(RewardConfig):
             # enable per-run via reward.scales.feet_slide / feet_yaw (negative=penalty).
             "feet_slide": 0.0,
             "feet_yaw": 0.0,
+            # ── P0/P1 smoothness terms (see the matching _reward_* methods) ──
+            # Ported from the official SONIC reward + the G1 sim2real variant and
+            # retuned for H2 (taller/heavier, effort ≈ 3× G1). All in per-step
+            # (pre-ctrl_dt) units; watch reward/<name> in the iteration log and
+            # scale the weight so each penalty sits well below the tracking terms.
+            #   joint_acc_l2      : official "feet_acc" — L2 of ankle joint accel.
+            #                       Joint-space (rad/s²) so ~robot-size invariant;
+            #                       keep the official -2.5e-7.
+            #   joint_torque_l2   : L2 of PD torque. H2 effort ≈ 3× G1 → torque² ≈ 9×,
+            #                       so start ~9× LOWER than a G1 weight. Tune via log
+            #                       (target roughly -0.05 … -0.15).
+            #   anti_shake_ang_vel: deadzone jitter penalty, wrists (body ang-vel) +
+            #                       head (joint-vel). Official weight; H2 adds an
+            #                       actuated head that otherwise has zero regulariser.
+            "joint_acc_l2": -2.5e-7,
+            "joint_torque_l2": -1.0e-6,
+            "anti_shake_ang_vel": -5.0e-3,
         }
     )
     std_local_points: float = 0.1
     # Robot foot world-z below this (flat ground) counts as "in contact" for the
     # feet_slide / feet_yaw gates. Calibrate to H2 ankle_roll_link stance height.
     feet_contact_height: float = 0.15
+    # Angular-speed / joint-speed deadzone (rad/s) for anti_shake_ang_vel. No penalty
+    # below this, so intentional wrist/head motion is free; only jitter is punished.
+    anti_shake_threshold: float = 1.5
 
 
 @registry.envcfg("H2SonicMotionTracking")
@@ -231,6 +251,34 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
                 "joint_vel": np.zeros((num_envs, H, n), dtype=dtype),
                 "last_actions": np.zeros((num_envs, H, n), dtype=dtype),
             }
+
+        # ── P0/P1 smoothness terms: joint_acc_l2 / joint_torque_l2 / anti_shake ──
+        # Joint order is the MJCF actuator order (no permutation for H2), so actuator
+        # names, PD gains (kp/kd), dof_pos and dof_vel are all mutually aligned.
+        act_names = self._backend.get_actuator_names()
+        self._ankle_dof_indices = np.asarray(
+            [i for i, nm in enumerate(act_names) if "ankle" in nm], dtype=np.intp
+        )
+        self._head_dof_indices = np.asarray(
+            [i for i, nm in enumerate(act_names) if "head" in nm], dtype=np.intp
+        )
+        try:
+            kp, kd = self._backend.get_actuator_gains()
+            self._torque_kp = np.asarray(kp, dtype=dtype)
+            self._torque_kd = np.asarray(kd, dtype=dtype)
+        except Exception:  # backend without PD gains → joint_torque_l2 returns 0
+            self._torque_kp = None
+            self._torque_kd = None
+        # Wrists ARE tracked bodies (14-body set); head is not, so anti_shake handles
+        # the head in joint-velocity space instead (see _reward_anti_shake_ang_vel).
+        self._wrist_body_indices = np.asarray(
+            [cfg.body_names.index("left_wrist_yaw_link"),
+             cfg.body_names.index("right_wrist_yaw_link")], dtype=np.intp,
+        )
+        # Previous-step joint velocity for the finite-difference joint acceleration.
+        # Updated at the end of every _compute_obs (including reset rows) so the first
+        # post-reset sample sees Δv from the new reference state, not a spurious jump.
+        self._prev_dof_vel = np.zeros((num_envs, n), dtype=dtype)
 
     @property
     def obs_groups_spec(self) -> dict[str, int]:
@@ -425,6 +473,60 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
         self._reward_fns["motion_local_points"] = self._reward_motion_local_points
         self._reward_fns["feet_slide"] = self._reward_feet_slide
         self._reward_fns["feet_yaw"] = self._reward_feet_yaw
+        self._reward_fns["joint_acc_l2"] = self._reward_joint_acc_l2
+        self._reward_fns["joint_torque_l2"] = self._reward_joint_torque_l2
+        self._reward_fns["anti_shake_ang_vel"] = self._reward_anti_shake_ang_vel
+
+    def _reward_joint_acc_l2(self, ctx: Any) -> np.ndarray:
+        """Official ``feet_acc``: L2 of finite-difference ankle joint acceleration.
+
+        ``acc = (dof_vel - prev_dof_vel) / ctrl_dt`` restricted to the ``.*ankle.*``
+        joints. ``_prev_dof_vel`` is seeded on every reset in :meth:`_compute_obs`,
+        so the first post-reset sample is a true Δv, not a spurious spike. Directly
+        smooths the foot motion that drives feet_slide / feet_yaw and the global
+        root-position drift seen in training.
+        """
+        idx = self._ankle_dof_indices
+        if idx.size == 0:
+            return np.zeros((self._num_envs,), dtype=get_global_dtype())
+        acc = (ctx.dof_vel[:, idx] - self._prev_dof_vel[:, idx]) / self._cfg.ctrl_dt
+        return np.asarray(np.sum(np.square(acc), axis=1), dtype=get_global_dtype())
+
+    def _reward_joint_torque_l2(self, ctx: Any) -> np.ndarray:
+        """L2 of the PD torque applied this step: ``kp·(target_q − q) − kd·q̇``.
+
+        ``target_q`` is the current residual action mapped through ``action_scale``
+        onto the (bias-adjusted) default pose. Penalizes raw actuator effort — the
+        principled smoothness term for H2, whose effort limits are ≈3× G1 so the
+        same jitter costs far more torque. Stateless (no reset seeding needed).
+        """
+        if self._torque_kp is None or self._torque_kd is None:
+            return np.zeros((self._num_envs,), dtype=get_global_dtype())
+        actions = ctx.info.get("current_actions")
+        if not isinstance(actions, np.ndarray):
+            return np.zeros((self._num_envs,), dtype=get_global_dtype())
+        base = self._effective_default_angles()
+        target_q = actions * self._cfg.control_config.action_scale + base
+        torque = self._torque_kp * (target_q - ctx.dof_pos) - self._torque_kd * ctx.dof_vel
+        return np.asarray(np.sum(np.square(torque), axis=1), dtype=get_global_dtype())
+
+    def _reward_anti_shake_ang_vel(self, ctx: Any) -> np.ndarray:
+        """Deadzone jitter penalty on wrists (body ang-vel) and head (joint-vel).
+
+        Wrists are tracked bodies → use world angular speed ``‖ω‖``. The head is not
+        in the 14-body set and has no reference motion in the G1→H2 retarget, so its
+        jitter is penalized in joint space via head dof velocity. Speeds below
+        ``anti_shake_threshold`` incur no penalty, leaving intentional motion free.
+        """
+        thr = self._cfg.reward_config.anti_shake_threshold
+        wv = ctx.robot_body_ang_vel_w[:, self._wrist_body_indices]
+        wspeed = np.sqrt(np.sum(np.square(wv), axis=2))
+        wexc = np.maximum(wspeed - thr, 0.0)
+        penalty = np.mean(np.square(wexc), axis=1)
+        if self._head_dof_indices.size:
+            hexc = np.maximum(np.abs(ctx.dof_vel[:, self._head_dof_indices]) - thr, 0.0)
+            penalty = penalty + np.mean(np.square(hexc), axis=1)
+        return np.asarray(penalty, dtype=get_global_dtype())
 
     def _reward_feet_slide(self, ctx: Any) -> np.ndarray:
         """Penalize horizontal foot velocity while the foot is near the ground.
@@ -551,6 +653,15 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
             info, motion_data, linvel, gyro, dof_pos, dof_vel, robot_body_pos_w, robot_body_quat_w
         )
         actor = self._build_sonic_actor(info, dof_pos, dof_vel, gyro, robot_body_pos_w, robot_body_quat_w)
+
+        # Cache dof_vel for next step's finite-difference joint_acc_l2. This runs on
+        # every obs path: full step (env_ids None → all rows) and reset/clip-resample
+        # (env_ids set → only those rows), so the acceleration never sees a reset jump.
+        env_ids = info.get("env_ids")
+        if env_ids is None:
+            self._prev_dof_vel[:] = dof_vel
+        else:
+            self._prev_dof_vel[env_ids] = dof_vel
         if self._cfg.critic_privileged_mf_hist:
             critic = self._build_sonic_critic(
                 info, motion_data, linvel, gyro, dof_pos, dof_vel, robot_body_pos_w, robot_body_quat_w,
