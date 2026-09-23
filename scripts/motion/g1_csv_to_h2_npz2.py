@@ -427,6 +427,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no_ground", action="store_true", help="disable the floor-penetration grounding pass")
     p.add_argument("--ground_tol", type=float, default=0.0, help="allowed foot penetration (m) before lifting")
     p.add_argument("--limit", type=int, default=0, help="convert only the first N clips (0=all)")
+    p.add_argument(
+        "--skip_existing", action="store_true",
+        help="skip clips whose output .npz already exists (resume an interrupted batch run)",
+    )
     p.add_argument("--dry-run", action="store_true", help="validate/plan without writing NPZ")
     p.add_argument("--debug", action="store_true", help="report mean foot-target residual per clip")
     return p.parse_args()
@@ -457,7 +461,11 @@ def main() -> None:
         return
 
     failures: list[tuple[Path, str]] = []
+    skipped = 0
     for csv_file, output_file in zip(csv_files, output_files, strict=True):
+        if args.skip_existing and output_file.exists():
+            skipped += 1
+            continue
         try:
             loader = MotionLoader(
                 motion_file=csv_file,
@@ -479,8 +487,10 @@ def main() -> None:
             failures.append((csv_file, str(exc)))
             print(f"[g1_csv_to_h2_npz2] FAILED {csv_file.name}: {exc}")
 
-    ok = len(csv_files) - len(failures)
+    ok = len(csv_files) - len(failures) - skipped
     print(f"[g1_csv_to_h2_npz2] done: {ok}/{len(csv_files)} converted -> {output_files[0].parent}")
+    if skipped:
+        print(f"[g1_csv_to_h2_npz2] {skipped} skipped (already existed)")
     if failures:
         print(f"[g1_csv_to_h2_npz2] {len(failures)} failed")
 
