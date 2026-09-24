@@ -253,3 +253,12 @@ class SonicH2ActorModel(SonicG1ActorModel):
         kwargs.setdefault("enc_dim", 680)
         kwargs.setdefault("proprio_dim", 990)
         super().__init__(*args, **kwargs)
+
+
+class SonicGR2ActorModel(SonicG1ActorModel):
+    """SONIC actor for the fixed-head Fourier GR2 27-DoF profile."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("enc_dim", 600)
+        kwargs.setdefault("proprio_dim", 870)
+        super().__init__(*args, **kwargs)

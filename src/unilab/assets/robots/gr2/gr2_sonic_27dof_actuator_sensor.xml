@@ -1,45 +1,46 @@
 <mujoco model="GR2T2 SONIC 27DoF">
   <actuator>
-    <position name="waist_yaw" joint="waist_yaw_joint" kp="80" kv="4" forcerange="-74.45 74.45"/>
+    <position name="waist_yaw" joint="waist_yaw_joint" kp="200" kv="10" forcerange="-74.45 74.45"/>
 
-    <position name="left_shoulder_pitch" joint="left_shoulder_pitch_joint" kp="40" kv="2" forcerange="-74.45 74.45"/>
-    <position name="left_shoulder_roll" joint="left_shoulder_roll_joint" kp="40" kv="2" forcerange="-74.45 74.45"/>
-    <position name="left_shoulder_yaw" joint="left_shoulder_yaw_joint" kp="40" kv="2" forcerange="-42.75 42.75"/>
-    <position name="left_elbow_pitch" joint="left_elbow_pitch_joint" kp="40" kv="2" forcerange="-42.75 42.75"/>
-    <position name="left_wrist_yaw" joint="left_wrist_yaw_joint" kp="15" kv="1" forcerange="-17.325 17.325"/>
-    <position name="left_wrist_pitch" joint="left_wrist_pitch_joint" kp="15" kv="1" forcerange="-17.325 17.325"/>
-    <position name="left_wrist_roll" joint="left_wrist_roll_joint" kp="15" kv="1" forcerange="-17.325 17.325"/>
+    <position name="left_shoulder_pitch" joint="left_shoulder_pitch_joint" kp="300" kv="10" forcerange="-74.45 74.45"/>
+    <position name="left_shoulder_roll" joint="left_shoulder_roll_joint" kp="300" kv="10" forcerange="-74.45 74.45"/>
+    <position name="left_shoulder_yaw" joint="left_shoulder_yaw_joint" kp="100" kv="5" forcerange="-42.75 42.75"/>
+    <position name="left_elbow_pitch" joint="left_elbow_pitch_joint" kp="100" kv="5" forcerange="-42.75 42.75"/>
+    <position name="left_wrist_yaw" joint="left_wrist_yaw_joint" kp="50" kv="5" forcerange="-17.325 17.325"/>
+    <position name="left_wrist_pitch" joint="left_wrist_pitch_joint" kp="50" kv="5" forcerange="-17.325 17.325"/>
+    <position name="left_wrist_roll" joint="left_wrist_roll_joint" kp="50" kv="5" forcerange="-17.325 17.325"/>
 
-    <position name="right_shoulder_pitch" joint="right_shoulder_pitch_joint" kp="40" kv="2" forcerange="-74.45 74.45"/>
-    <position name="right_shoulder_roll" joint="right_shoulder_roll_joint" kp="40" kv="2" forcerange="-74.45 74.45"/>
-    <position name="right_shoulder_yaw" joint="right_shoulder_yaw_joint" kp="40" kv="2" forcerange="-42.75 42.75"/>
-    <position name="right_elbow_pitch" joint="right_elbow_pitch_joint" kp="40" kv="2" forcerange="-42.75 42.75"/>
-    <position name="right_wrist_yaw" joint="right_wrist_yaw_joint" kp="15" kv="1" forcerange="-17.325 17.325"/>
-    <position name="right_wrist_pitch" joint="right_wrist_pitch_joint" kp="15" kv="1" forcerange="-17.325 17.325"/>
-    <position name="right_wrist_roll" joint="right_wrist_roll_joint" kp="15" kv="1" forcerange="-17.325 17.325"/>
+    <position name="right_shoulder_pitch" joint="right_shoulder_pitch_joint" kp="300" kv="10" forcerange="-74.45 74.45"/>
+    <position name="right_shoulder_roll" joint="right_shoulder_roll_joint" kp="300" kv="10" forcerange="-74.45 74.45"/>
+    <position name="right_shoulder_yaw" joint="right_shoulder_yaw_joint" kp="100" kv="5" forcerange="-42.75 42.75"/>
+    <position name="right_elbow_pitch" joint="right_elbow_pitch_joint" kp="100" kv="5" forcerange="-42.75 42.75"/>
+    <position name="right_wrist_yaw" joint="right_wrist_yaw_joint" kp="50" kv="5" forcerange="-17.325 17.325"/>
+    <position name="right_wrist_pitch" joint="right_wrist_pitch_joint" kp="50" kv="5" forcerange="-17.325 17.325"/>
+    <position name="right_wrist_roll" joint="right_wrist_roll_joint" kp="50" kv="5" forcerange="-17.325 17.325"/>
 
-    <position name="left_hip_pitch" joint="left_hip_pitch_joint" kp="150" kv="5" forcerange="-224.4 224.4"/>
-    <position name="left_hip_roll" joint="left_hip_roll_joint" kp="150" kv="5" forcerange="-95.472 95.472"/>
-    <position name="left_hip_yaw" joint="left_hip_yaw_joint" kp="80" kv="4" forcerange="-43.83 43.83"/>
-    <position name="left_knee_pitch" joint="left_knee_pitch_joint" kp="150" kv="5" forcerange="-224.4 224.4"/>
-    <position name="left_ankle_pitch" joint="left_ankle_pitch_joint" kp="40" kv="2" forcerange="-43.83 43.83"/>
-    <position name="left_ankle_roll" joint="left_ankle_roll_joint" kp="40" kv="2" forcerange="-29.835 29.835"/>
+    <position name="left_hip_pitch" joint="left_hip_pitch_joint" kp="90" kv="19" forcerange="-224.4 224.4"/>
+    <position name="left_hip_roll" joint="left_hip_roll_joint" kp="180" kv="10" forcerange="-95.472 95.472"/>
+    <position name="left_hip_yaw" joint="left_hip_yaw_joint" kp="120" kv="9" forcerange="-43.83 43.83"/>
+    <position name="left_knee_pitch" joint="left_knee_pitch_joint" kp="90" kv="19" forcerange="-224.4 224.4"/>
+    <position name="left_ankle_pitch" joint="left_ankle_pitch_joint" kp="30" kv="5" forcerange="-43.83 43.83"/>
+    <position name="left_ankle_roll" joint="left_ankle_roll_joint" kp="60" kv="3.5" forcerange="-29.835 29.835"/>
 
-    <position name="right_hip_pitch" joint="right_hip_pitch_joint" kp="150" kv="5" forcerange="-224.4 224.4"/>
-    <position name="right_hip_roll" joint="right_hip_roll_joint" kp="150" kv="5" forcerange="-95.472 95.472"/>
-    <position name="right_hip_yaw" joint="right_hip_yaw_joint" kp="80" kv="4" forcerange="-43.83 43.83"/>
-    <position name="right_knee_pitch" joint="right_knee_pitch_joint" kp="150" kv="5" forcerange="-224.4 224.4"/>
-    <position name="right_ankle_pitch" joint="right_ankle_pitch_joint" kp="40" kv="2" forcerange="-43.83 43.83"/>
-    <position name="right_ankle_roll" joint="right_ankle_roll_joint" kp="40" kv="2" forcerange="-29.835 29.835"/>
+    <position name="right_hip_pitch" joint="right_hip_pitch_joint" kp="90" kv="19" forcerange="-224.4 224.4"/>
+    <position name="right_hip_roll" joint="right_hip_roll_joint" kp="180" kv="10" forcerange="-95.472 95.472"/>
+    <position name="right_hip_yaw" joint="right_hip_yaw_joint" kp="120" kv="9" forcerange="-43.83 43.83"/>
+    <position name="right_knee_pitch" joint="right_knee_pitch_joint" kp="90" kv="19" forcerange="-224.4 224.4"/>
+    <position name="right_ankle_pitch" joint="right_ankle_pitch_joint" kp="30" kv="5" forcerange="-43.83 43.83"/>
+    <position name="right_ankle_roll" joint="right_ankle_roll_joint" kp="60" kv="3.5" forcerange="-29.835 29.835"/>
   </actuator>
 
   <sensor>
     <accelerometer name="baselink-baseAcc" site="imu"/>
     <gyro name="baselink-gyro" site="imu"/>
     <framequat name="baselink-quat" objtype="site" objname="imu"/>
+    <framezaxis name="baselink-upvector" objtype="site" objname="imu"/>
     <touch name="lf-touch" site="lf-tc"/>
     <touch name="rf-touch" site="rf-tc"/>
     <framepos name="baselink-position" objtype="site" objname="imu"/>
-    <framelinvel name="baselink-velocity" objtype="site" objname="imu"/>
+    <velocimeter name="baselink-velocity" site="imu"/>
   </sensor>
 </mujoco>

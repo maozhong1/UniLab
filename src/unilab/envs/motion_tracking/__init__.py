@@ -4,6 +4,7 @@ __unilab_registry_modules__ = (
     "unilab.envs.motion_tracking.g1",
     "unilab.envs.motion_tracking.x2",
     "unilab.envs.motion_tracking.h2",
+    "unilab.envs.motion_tracking.gr2",
 )
 
 from .g1 import (
@@ -45,6 +46,10 @@ from .g1 import (
     G1WBTObsCfg,
     G1WBTObsEnv,
 )
+from .gr2 import (
+    GR2SonicMotionTrackingCfg,
+    GR2SonicMotionTrackingEnv,
+)
 from .h2 import (
     H2SonicMotionTrackingCfg,
     H2SonicMotionTrackingEnv,
@@ -80,6 +85,8 @@ __all__ = [
     "BoxMotionLoader",
     "H2SonicMotionTrackingCfg",
     "H2SonicMotionTrackingEnv",
+    "GR2SonicMotionTrackingCfg",
+    "GR2SonicMotionTrackingEnv",
     "X2MotionTrackingCfg",
     "X2WallFlipTrackingCfg",
     "X2WallFlipTrackingEnv",

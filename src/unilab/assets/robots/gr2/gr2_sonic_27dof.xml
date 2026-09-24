@@ -7,6 +7,7 @@
   <include file="gr2_sonic_27dof_actuator_sensor.xml"/>
   <default>
       <joint damping="0.2" frictionloss="0.2" armature="0.01"/>
+      <position inheritrange="1"/>
   </default> 
 
   <asset>
@@ -170,14 +171,16 @@
               <body name="left_foot_pitch_link" pos="0 0 -0.406">
                 <inertial pos="0.026267 1.226e-05 0.0010987" quat="-0.0560581 0.713517 -0.0571676 0.696049" mass="0.17877" diaginertia="0.000220267 0.000219111 1.24827e-05"/>
                 <joint name="left_ankle_pitch_joint" pos="0 0 0" axis="0 1 0" range="-0.7854 0.7854" armature="0.165"/>
-                <geom type="mesh" contype="1" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="left_foot_pitch_link"/>
+                <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="left_foot_pitch_link"/>
                 <body name="left_foot_roll_link">
                   <inertial pos="0.050086 0.006159 -0.032795" quat="-0.0752306 0.721459 -0.127307 0.676484" mass="1.1232" diaginertia="0.00729384 0.00667953 0.00120783"/>
                   <joint name="left_ankle_roll_joint" pos="0 0 0" axis="1 0 0" range="-0.38397 0.38397" armature="0.031"/>
-                  <geom type="mesh" contype="1" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="left_foot_roll_link"/>
+                  <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="left_foot_roll_link"/>
                   <!-- <geom size="0.025 0.14" pos="0.06 -0.025 -0.033" quat="0.707388 0 0.706825 0" type="cylinder" rgba="1 1 1 1"/> -->
                   <!-- <geom size="0.025 0.14" pos="0.06 0.025 -0.033" quat="0.707388 0 0.706825 0" type="cylinder" rgba="1 1 1 1"/> -->
-                  <geom name="l_foot_sole" group="3" type="box" pos="0.05 0 -0.065" size="0.12 0.03 0.001" rgba="1 0 0 0.2"/>
+                  <!-- Reference baseline from Fourier's 21-DoF GR2T2V2 model; not a final hardware calibration. -->
+                  <geom name="l_foot_sole" group="3" type="box" pos="0.06 0 -0.048" size="0.14 0.05 0.01"
+                    contype="1" conaffinity="1" condim="3" friction="1 0.005 0.0001" solref="0.005 1" rgba="1 0 0 0.2"/>
                   <site name="lf-tc" type="box" size="0.123 0.041  0.065"  pos="0.04749999940395355 0.0012208642475975968 -0.02722398766749333"  rgba="0 1 0 0" />
                 </body>
               </body>
@@ -207,14 +210,16 @@
               <body name="right_foot_pitch_link" pos="0 0 -0.406">
                 <inertial pos="0.026267 -1.226e-05 0.0010987" quat="0.0560581 0.713517 0.0571676 0.696049" mass="0.17877" diaginertia="0.000220267 0.000219111 1.24827e-05"/>
                 <joint name="right_ankle_pitch_joint" pos="0 0 0" axis="0 1 0" range="-0.7854 0.7854" armature="0.165"/>
-                <geom type="mesh" contype="1" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="right_foot_pitch_link"/>
+                <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="right_foot_pitch_link"/>
                 <body name="right_foot_roll_link">
                   <inertial pos="0.050086 -0.006159 -0.032795" quat="0.0752306 0.721459 0.127307 0.676484" mass="1.1232" diaginertia="0.00729384 0.00667953 0.00120783"/>
                   <joint name="right_ankle_roll_joint" pos="0 0 0" axis="1 0 0" range="-0.38397 0.38397" armature="0.031"/>
-                  <geom type="mesh" contype="1" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="right_foot_roll_link"/>
+                  <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="right_foot_roll_link"/>
                   <!-- <geom size="0.025 0.14" pos="0.06 -0.025 -0.033" quat="0.707388 0 0.706825 0" type="cylinder" rgba="1 1 1 1"/> -->
                   <!-- <geom size="0.025 0.14" pos="0.06 0.025 -0.033" quat="0.707388 0 0.706825 0" type="cylinder" rgba="1 1 1 1"/> -->
-                  <geom name="r_foot_sole" group="3" type="box" pos="0.05 0 -0.065" size="0.12 0.03 0.001" rgba="1 0 0 0.2"/>
+                  <!-- Reference baseline from Fourier's 21-DoF GR2T2V2 model; not a final hardware calibration. -->
+                  <geom name="r_foot_sole" group="3" type="box" pos="0.06 0 -0.048" size="0.14 0.05 0.01"
+                    contype="1" conaffinity="1" condim="3" friction="1 0.005 0.0001" solref="0.005 1" rgba="1 0 0 0.2"/>
                   <site name="rf-tc" type="box" size="0.123 0.041  0.065"  pos="0.04749999940395355 0.0012208642475975968 -0.02722398766749333"  rgba="0 1 0 0" />
                 </body>
               </body>

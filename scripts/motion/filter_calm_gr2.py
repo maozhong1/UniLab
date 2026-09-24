@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a conservative GR2 motion subset for early curriculum training.
+"""Build the Stage 1 GR2 motion subset for from-scratch curriculum training.
 
 Unlike the H2 filter, this tool uses several independent limits so fast turns,
 joint-speed spikes, jumps, and high kicks cannot pass solely because one aggregate
@@ -137,12 +137,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--src", required=True, help="directory of GR2 NPZ clips")
     parser.add_argument("--dst", help="calm subset directory (default: <src>_calm)")
-    parser.add_argument("--body-ang-p99", type=float, default=8.0, metavar="RAD_S")
-    parser.add_argument("--joint-vel-p99", type=float, default=7.0, metavar="RAD_S")
-    parser.add_argument("--base-lin-p99", type=float, default=1.8, metavar="M_S")
-    parser.add_argument("--base-ang-p99", type=float, default=2.5, metavar="RAD_S")
-    parser.add_argument("--base-z-range", type=float, default=0.25, metavar="M")
-    parser.add_argument("--foot-height-max", type=float, default=0.45, metavar="M")
+    parser.add_argument("--body-ang-p99", type=float, default=6.5, metavar="RAD_S")
+    parser.add_argument("--joint-vel-p99", type=float, default=5.5, metavar="RAD_S")
+    parser.add_argument("--base-lin-p99", type=float, default=1.35, metavar="M_S")
+    parser.add_argument("--base-ang-p99", type=float, default=2.0, metavar="RAD_S")
+    parser.add_argument("--base-z-range", type=float, default=0.15, metavar="M")
+    parser.add_argument("--foot-height-max", type=float, default=0.35, metavar="M")
     parser.add_argument("--copy", action="store_true", help="copy instead of symlink")
     parser.add_argument("--dry-run", action="store_true", help="scan without writing")
     parser.add_argument("--show-dropped", type=int, default=20)
