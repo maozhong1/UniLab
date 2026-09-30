@@ -156,6 +156,15 @@ class MotionTrackingEnv(G1BaseEnv):
         self._weighted_reward = np.empty((num_envs,), dtype=dtype)
         self._terminated = np.empty((num_envs,), dtype=bool)
         self._env_bool = np.empty((num_envs,), dtype=bool)
+        self._termination_reason_masks = {
+            name: np.zeros((num_envs,), dtype=bool)
+            for name in (
+                "anchor_height",
+                "anchor_tilt",
+                "end_effector_height",
+                "undesired_contact",
+            )
+        }
         self._ee_pos_error_z = np.empty((num_envs, self.ee_body_indices.size), dtype=dtype)
         self._ee_terminated = np.empty((num_envs, self.ee_body_indices.size), dtype=bool)
         self._undesired_contact_mask = np.empty(
@@ -352,6 +361,10 @@ class MotionTrackingEnv(G1BaseEnv):
             dof_pos,
             dof_vel,
         )
+        log = state.info.setdefault("log", {})
+        for name, mask in self._ensure_termination_reason_masks().items():
+            log[f"termination/{name}"] = float(np.mean(mask))
+        log["termination/any"] = float(np.mean(terminated))
 
         # Compute observations
         obs = self._compute_obs(
@@ -385,13 +398,21 @@ class MotionTrackingEnv(G1BaseEnv):
 
     def _compute_truncated(self, state: NpEnvState) -> np.ndarray:
         truncated = super()._compute_truncated(state)
+        time_limit_rate = float(np.mean(truncated))
         clip_end_only = getattr(self, "_env_bool", None)
         if clip_end_only is None or clip_end_only.shape != (self._num_envs,):
             clip_end_only = np.empty((self._num_envs,), dtype=bool)
             self._env_bool = clip_end_only
         np.logical_not(state.terminated, out=clip_end_only)
         np.logical_and(self._clip_end_truncated, clip_end_only, out=clip_end_only)
+        clip_end_rate = float(np.mean(clip_end_only))
         np.logical_or(truncated, clip_end_only, out=truncated)
+        log = state.info.setdefault("log", {})
+        log["truncation/time_limit"] = time_limit_rate
+        log["truncation/clip_end"] = clip_end_rate
+        log["truncation/any"] = float(np.mean(truncated))
+        np.logical_or(state.terminated, truncated, out=clip_end_only)
+        log["episode_end/any"] = float(np.mean(clip_end_only))
         return truncated
 
     def _update_relative_transforms(
@@ -407,7 +428,24 @@ class MotionTrackingEnv(G1BaseEnv):
         robot_body_quat_w: np.ndarray,
     ) -> np.ndarray:
         """Compute termination conditions."""
+        for mask in self._ensure_termination_reason_masks().values():
+            mask.fill(False)
         return compute_terminations(self, motion_data, robot_body_pos_w, robot_body_quat_w)
+
+    def _ensure_termination_reason_masks(self) -> dict[str, np.ndarray]:
+        masks = getattr(self, "_termination_reason_masks", None)
+        if masks is None:
+            masks = {
+                name: np.zeros((self._num_envs,), dtype=bool)
+                for name in (
+                    "anchor_height",
+                    "anchor_tilt",
+                    "end_effector_height",
+                    "undesired_contact",
+                )
+            }
+            self._termination_reason_masks = masks
+        return masks
 
     def _write_body_pos_in_anchor_frame(
         self,

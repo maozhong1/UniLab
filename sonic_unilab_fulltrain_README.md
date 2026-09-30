@@ -212,9 +212,9 @@ Important defaults and launcher overrides are:
 | rollout steps per environment | 24 | launcher |
 | maximum iterations | 20000 | launcher |
 | checkpoint interval | 100 | launcher |
-| initial action std | 0.50 | launcher |
-| learning rate | `2e-5` | launcher |
-| entropy coefficient | `0.004` | launcher |
+| initial action std | 0.50 | launcher; checkpoint value is restored on resume |
+| learning rate | `2e-5` (`1e-5` for Stage 2.5) | launcher |
+| entropy coefficient | `0.004` (`0.003` for Stage 2.5) | launcher |
 | desired KL | `0.01` | launcher |
 | adaptive maximum learning rate | `2e-4` | launcher |
 
@@ -355,7 +355,7 @@ standard deviation, per-term unweighted rewards, weighted torque contribution, j
 limits, foot contact-height gates, and actuator saturation. GR2 is substantially heavier
 than G1, so G1 torque-penalty magnitudes are not directly transferable.
 
-### 5.4 Continue with Stage 2, Stage 3, and full data
+### 5.4 Continue with Stage 2, Stage 2.5, Stage 3, and full data
 
 For every stage after Stage 1, provide the previous run directory name through `LOAD_RUN`.
 The launcher finds and resumes its numerically latest `model_*.pt`.
@@ -371,8 +371,36 @@ SOURCE_NPZ_DIR="$NPZ_DIR" CURRICULUM_STAGE=2 LOAD_RUN="$STAGE1_RUN" \
 Then continue from the Stage 2 run:
 
 ```bash
-STAGE2_RUN=<stage-2-run-directory>
-SOURCE_NPZ_DIR="$NPZ_DIR" CURRICULUM_STAGE=3 LOAD_RUN="$STAGE2_RUN" \
+STAGE2_RUN=2026-09-24_22-40-40_mujoco
+CURRICULUM_STAGE=2.5 LOAD_RUN="$STAGE2_RUN" \
+  ./scripts/sonic/full_train_gr2.sh
+```
+
+Stage 2.5 merges the base motion directory with the upright-manipulation directory and
+applies the Stage 2 filter to the combined set. Its lower learning rate and entropy
+coefficient reduce policy drift while introducing the new motion distribution. Because
+the full actor state is restored, the resumed action standard deviation starts from the
+checkpoint value (about `0.91` for `model_2800.pt`), not the construction-time
+`init_std=0.50`.
+
+Stage 2.5 also replaces the raw action-difference penalty with
+`target_rate_l2=-0.05`, which penalizes changes in the physical PD position target
+`action_scale * (action_t - action_t-1)`, and enables
+`upper_body_joint_pos=0.5` for the 14 shoulder, elbow, and wrist joints. Neither term
+changes policy inputs, outputs, action scaling, or checkpoint shapes, so an existing
+27-DoF checkpoint remains resume-compatible.
+
+TensorBoard rollout logs include overlapping per-step termination rates under
+`termination/*` and total/upper-body requested-PD-torque saturation estimates under
+`diagnostic/*`. The saturation values compare requested PD torque with the limits
+implied by the fixed GR2 action-scale contract; they are estimates, not measured
+actuator-force telemetry.
+
+Continue Stage 3 from the new Stage 2.5 run:
+
+```bash
+STAGE2_5_RUN=<stage-2.5-run-directory>
+SOURCE_NPZ_DIR="$NPZ_DIR" CURRICULUM_STAGE=3 LOAD_RUN="$STAGE2_5_RUN" \
   ./scripts/sonic/full_train_gr2.sh
 ```
 
@@ -390,6 +418,7 @@ The automatic filter limits are:
 |---|---:|---:|---:|---:|---:|---:|
 | 1 | 6.5 | 5.5 | 1.35 | 2.0 | 0.15 | 0.35 |
 | 2 | 8.0 | 7.0 | 1.8 | 2.5 | 0.25 | 0.45 |
+| 2.5 | 8.0 | 7.0 | 1.8 | 2.5 | 0.25 | 0.45 |
 | 3 | 12.0 | 9.5 | 2.2 | 4.0 | 0.35 | 0.65 |
 | full | no filter | no filter | no filter | no filter | no filter | no filter |
 
@@ -400,9 +429,18 @@ The launcher accepts these environment variables:
 | Variable | Default | Meaning |
 |---|---|---|
 | `SOURCE_NPZ_DIR` | repository-local development path | complete 27-DoF motion source |
+| `MANIPULATION_NPZ_DIR` | repository-local upright-operations path | motions added during Stage 2.5 |
 | `NPZ_DIR` | unset | bypass automatic filtering and use this directory directly |
-| `CURRICULUM_STAGE` | `1` | `1`, `2`, `3`, or `full` |
+| `CURRICULUM_STAGE` | `1` | `1`, `2`, `2.5`, `3`, or `full` |
 | `LOAD_RUN` | unset | prior run directory; required after Stage 1 |
+| `LEARNING_RATE` | stage-dependent | `1e-5` for Stage 2.5; otherwise `2e-5` |
+| `ADAPTIVE_LR_MAX` | `2e-4` | maximum shared LR under adaptive-KL scheduling |
+| `ENTROPY_COEF` | stage-dependent | `0.003` for Stage 2.5; otherwise `0.004` |
+| `ROOT_POS_SCALE` | stage-dependent | `0.75` for Stage 2.5; otherwise `0.5` |
+| `ACTION_RATE_L2_SCALE` | stage-dependent | `0` for Stage 2.5; otherwise `-0.01` |
+| `TARGET_RATE_L2_SCALE` | stage-dependent | `-0.05` for Stage 2.5; otherwise `0` |
+| `UPPER_BODY_JOINT_POS_SCALE` | stage-dependent | `0.5` for Stage 2.5; otherwise `0` |
+| `INIT_STD` | `0.50` | construction value; restored actor std wins on resume |
 | `NUM_ENVS` | `4096` | parallel environments |
 | `NUM_STEPS` | `24` | rollout steps per environment |
 | `MAX_ITERATIONS` | `20000` | PPO iterations in this invocation |

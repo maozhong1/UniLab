@@ -58,6 +58,8 @@ reward:
     motion_local_points: 2.0
     undesired_contacts: -0.1
     action_rate_l2: -0.01
+    target_rate_l2: 0.0
+    upper_body_joint_pos: 0.0
     joint_limit: -10.0
     feet_slide: 0.0
     feet_yaw: 0.0
@@ -71,6 +73,7 @@ reward:
   std_body_lin_vel: 1.0
   std_body_ang_vel: 3.14
   std_joint_pos: 0.2
+  std_upper_body_joint_pos: 0.2
   std_joint_vel: 1.0
 play_profile:
   enabled: true

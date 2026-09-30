@@ -105,9 +105,12 @@ class SonicRewardConfig(RewardConfig):
             "joint_acc_l2": -2.5e-7,
             "joint_torque_l2": -1.0e-6,
             "anti_shake_ang_vel": -5.0e-3,
+            "target_rate_l2": 0.0,
+            "upper_body_joint_pos": 0.0,
         }
     )
     std_local_points: float = 0.1
+    std_upper_body_joint_pos: float = 0.2
     # Robot foot world-z below this (flat ground) counts as "in contact" for the
     # feet_slide / feet_yaw gates, calibrated to GR2 foot-roll stance height.
     feet_contact_height: float = 0.08
@@ -197,6 +200,17 @@ class GR2SonicMotionTrackingEnv(MotionTrackingEnv):
         )
         self._strict_done = np.empty((num_envs,), dtype=bool)
         self._strict_ee_mask = np.empty((num_envs, self.ee_body_indices.size), dtype=bool)
+        self._termination_reason_masks.update(
+            {
+                name: np.zeros((num_envs,), dtype=bool)
+                for name in (
+                    "strict_anchor_height",
+                    "strict_end_effector_height",
+                    "strict_anchor_orientation",
+                    "strict_foot_position",
+                )
+            }
+        )
 
         # feet_slide / feet_yaw penalty scratch (zero-alloc hot path). Contact is
         # proxied by robot foot world-z < feet_contact_height (see SonicRewardConfig).
@@ -256,13 +270,29 @@ class GR2SonicMotionTrackingEnv(MotionTrackingEnv):
         self._ankle_dof_indices = np.asarray(
             [i for i, nm in enumerate(act_names) if "ankle" in nm], dtype=np.intp
         )
+        self._upper_body_dof_indices = np.asarray(
+            [
+                i
+                for i, name in enumerate(act_names)
+                if any(part in name for part in ("shoulder", "elbow", "wrist"))
+            ],
+            dtype=np.intp,
+        )
         try:
             kp, kd = self._backend.get_actuator_gains()
             self._torque_kp = np.asarray(kp, dtype=dtype)
             self._torque_kd = np.asarray(kd, dtype=dtype)
+            self._torque_limit = (
+                np.abs(np.asarray(cfg.control_config.action_scale, dtype=dtype))
+                * self._torque_kp
+                / 0.25
+            )
         except Exception:  # backend without PD gains → joint_torque_l2 returns 0
             self._torque_kp = None
             self._torque_kd = None
+            self._torque_limit = None
+        self._estimated_torque = np.empty((num_envs, n), dtype=dtype)
+        self._torque_saturated = np.empty((num_envs, n), dtype=bool)
         self._wrist_body_indices = np.asarray(
             [cfg.body_names.index("left_hand_yaw_link"),
              cfg.body_names.index("right_hand_yaw_link")], dtype=np.intp,
@@ -468,6 +498,30 @@ class GR2SonicMotionTrackingEnv(MotionTrackingEnv):
         self._reward_fns["joint_acc_l2"] = self._reward_joint_acc_l2
         self._reward_fns["joint_torque_l2"] = self._reward_joint_torque_l2
         self._reward_fns["anti_shake_ang_vel"] = self._reward_anti_shake_ang_vel
+        self._reward_fns["target_rate_l2"] = self._reward_target_rate_l2
+        self._reward_fns["upper_body_joint_pos"] = self._reward_upper_body_joint_pos
+
+    def _reward_target_rate_l2(self, ctx: Any) -> np.ndarray:
+        """Squared change in physical PD position targets, in radian units."""
+        np.subtract(ctx.info["current_actions"], ctx.info["last_actions"], out=ctx.joint_error)
+        ctx.joint_error *= self._cfg.control_config.action_scale
+        np.square(ctx.joint_error, out=ctx.joint_error)
+        np.sum(ctx.joint_error, axis=1, out=ctx.env_error)
+        return ctx.env_error
+
+    def _reward_upper_body_joint_pos(self, ctx: Any) -> np.ndarray:
+        """Track the 14 shoulder, elbow, and wrist joints without changing observations."""
+        idx = self._upper_body_dof_indices
+        error = ctx.motion_data.joint_pos[:, idx] - ctx.dof_pos[:, idx]
+        np.square(error, out=error)
+        np.mean(error, axis=1, out=ctx.env_error)
+        np.divide(
+            ctx.env_error,
+            -(self._cfg.reward_config.std_upper_body_joint_pos**2),
+            out=ctx.reward_term,
+        )
+        np.exp(ctx.reward_term, out=ctx.reward_term)
+        return ctx.reward_term
 
     def _reward_joint_acc_l2(self, ctx: Any) -> np.ndarray:
         """Official ``feet_acc``: L2 of finite-difference ankle joint acceleration.
@@ -500,6 +554,49 @@ class GR2SonicMotionTrackingEnv(MotionTrackingEnv):
         target_q = actions * self._cfg.control_config.action_scale + base
         torque = self._torque_kp * (target_q - ctx.dof_pos) - self._torque_kd * ctx.dof_vel
         return np.asarray(np.sum(np.square(torque), axis=1), dtype=get_global_dtype())
+
+    def _compute_reward(
+        self,
+        info,
+        motion_data,
+        robot_body_pos_w,
+        robot_body_quat_w,
+        robot_body_lin_vel_w,
+        robot_body_ang_vel_w,
+        dof_pos,
+        dof_vel,
+    ):
+        reward = super()._compute_reward(
+            info,
+            motion_data,
+            robot_body_pos_w,
+            robot_body_quat_w,
+            robot_body_lin_vel_w,
+            robot_body_ang_vel_w,
+            dof_pos,
+            dof_vel,
+        )
+        if self._torque_limit is not None:
+            actions = info.get("current_actions")
+            if isinstance(actions, np.ndarray):
+                target_q = actions * self._cfg.control_config.action_scale
+                target_q += self._effective_default_angles()
+                np.subtract(target_q, dof_pos, out=self._estimated_torque)
+                self._estimated_torque *= self._torque_kp
+                self._estimated_torque -= self._torque_kd * dof_vel
+                np.greater_equal(
+                    np.abs(self._estimated_torque),
+                    self._torque_limit,
+                    out=self._torque_saturated,
+                )
+                log = info.setdefault("log", {})
+                log["diagnostic/estimated_torque_saturation_ratio"] = float(
+                    np.mean(self._torque_saturated)
+                )
+                log["diagnostic/estimated_upper_body_torque_saturation_ratio"] = float(
+                    np.mean(self._torque_saturated[:, self._upper_body_dof_indices])
+                )
+        return reward
 
     def _reward_anti_shake_ang_vel(self, ctx: Any) -> np.ndarray:
         """Deadzone jitter penalty on wrist body angular velocity."""
@@ -589,6 +686,7 @@ class GR2SonicMotionTrackingEnv(MotionTrackingEnv):
         low_reference = ref_anchor_pos[:, 2] < self._cfg.low_reference_height
         np.greater(self._env_error, self._cfg.low_reference_height_threshold, out=self._strict_done)
         self._env_bool[low_reference] = self._strict_done[low_reference]
+        self._termination_reason_masks["strict_anchor_height"][:] = self._env_bool
         terminated |= self._env_bool
 
         if self._has_ee_body_indices:
@@ -601,6 +699,7 @@ class GR2SonicMotionTrackingEnv(MotionTrackingEnv):
             np.greater(self._ee_pos_error_z, self._cfg.low_reference_height_threshold, out=self._strict_ee_mask)
             self._ee_terminated[low_reference] = self._strict_ee_mask[low_reference]
             np.logical_or.reduce(self._ee_terminated, axis=1, out=self._env_bool)
+            self._termination_reason_masks["strict_end_effector_height"][:] = self._env_bool
             terminated |= self._env_bool
 
         ref_quat = motion_data.body_quat_w[:, self.anchor_body_idx]
@@ -612,6 +711,7 @@ class GR2SonicMotionTrackingEnv(MotionTrackingEnv):
         self._env_error *= 2.0
         np.square(self._env_error, out=self._env_error)
         np.greater(self._env_error, self._cfg.strict_anchor_ori_error_sq, out=self._env_bool)
+        self._termination_reason_masks["strict_anchor_orientation"][:] = self._env_bool
         terminated |= self._env_bool
 
         np.subtract(
@@ -624,6 +724,7 @@ class GR2SonicMotionTrackingEnv(MotionTrackingEnv):
         np.sqrt(self._ee_pos_error_z[:, : self._strict_foot_indices.size], out=self._ee_pos_error_z[:, : self._strict_foot_indices.size])
         np.greater(self._ee_pos_error_z[:, : self._strict_foot_indices.size], self._cfg.strict_foot_pos_threshold, out=self._ee_terminated[:, : self._strict_foot_indices.size])
         np.logical_or.reduce(self._ee_terminated[:, : self._strict_foot_indices.size], axis=1, out=self._env_bool)
+        self._termination_reason_masks["strict_foot_position"][:] = self._env_bool
         terminated |= self._env_bool
         return terminated
 

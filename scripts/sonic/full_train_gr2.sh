@@ -2,17 +2,43 @@
 set -euo pipefail
 
 # GR2 SONIC curriculum training for the fixed-head 27-DoF profile.
-# Stage 1 starts from scratch. Stages 2, 3, and full require LOAD_RUN and
-# resume its newest checkpoint. Set NPZ_DIR to bypass automatic filtering.
+# Stage 1 starts from scratch. Stages 2, 2.5, 3, and full require LOAD_RUN and
+# resume its newest checkpoint. Stage 2.5 adds manipulation clips to the base
+# dataset before applying the Stage 2 filter. Set NPZ_DIR to bypass filtering.
 
 UNILAB="${UNILAB:-/home/maozhong/work/my_sonic/UniLab}"
 SOURCE_NPZ_DIR="${SOURCE_NPZ_DIR:-$HOME/work/sonic_vla_infer/bones_seed_3k_new/npz_gr2_27dof}"
+MANIPULATION_NPZ_DIR="${MANIPULATION_NPZ_DIR:-$HOME/work/sonic_vla_infer/bones-seed/selections/gr2_upright_operations_npz}"
 CURRICULUM_STAGE="${CURRICULUM_STAGE:-1}"
 NUM_ENVS="${NUM_ENVS:-4096}"
 NUM_STEPS="${NUM_STEPS:-24}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-20000}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-100}"
 WORK_DIR="${WORK_DIR:-/tmp/sonic_train}"
+
+if [[ "$CURRICULUM_STAGE" == "2.5" ]]; then
+  DEFAULT_LEARNING_RATE=1e-5
+  DEFAULT_ENTROPY_COEF=0.003
+  DEFAULT_ROOT_POS_SCALE=0.75
+  DEFAULT_ACTION_RATE_L2_SCALE=0.0
+  DEFAULT_TARGET_RATE_L2_SCALE=-0.05
+  DEFAULT_UPPER_BODY_JOINT_POS_SCALE=0.5
+else
+  DEFAULT_LEARNING_RATE=2e-5
+  DEFAULT_ENTROPY_COEF=0.004
+  DEFAULT_ROOT_POS_SCALE=0.5
+  DEFAULT_ACTION_RATE_L2_SCALE=-0.01
+  DEFAULT_TARGET_RATE_L2_SCALE=0.0
+  DEFAULT_UPPER_BODY_JOINT_POS_SCALE=0.0
+fi
+LEARNING_RATE="${LEARNING_RATE:-$DEFAULT_LEARNING_RATE}"
+ENTROPY_COEF="${ENTROPY_COEF:-$DEFAULT_ENTROPY_COEF}"
+ADAPTIVE_LR_MAX="${ADAPTIVE_LR_MAX:-2e-4}"
+ROOT_POS_SCALE="${ROOT_POS_SCALE:-$DEFAULT_ROOT_POS_SCALE}"
+ACTION_RATE_L2_SCALE="${ACTION_RATE_L2_SCALE:-$DEFAULT_ACTION_RATE_L2_SCALE}"
+TARGET_RATE_L2_SCALE="${TARGET_RATE_L2_SCALE:-$DEFAULT_TARGET_RATE_L2_SCALE}"
+UPPER_BODY_JOINT_POS_SCALE="${UPPER_BODY_JOINT_POS_SCALE:-$DEFAULT_UPPER_BODY_JOINT_POS_SCALE}"
+INIT_STD="${INIT_STD:-0.50}"
 
 cd "$UNILAB"
 mkdir -p "$WORK_DIR/motion_override"
@@ -26,7 +52,7 @@ if [[ -z "${NPZ_DIR:-}" ]]; then
         --base-z-range 0.15 --foot-height-max 0.35
       )
       ;;
-    2)
+    2|2.5)
       FILTER_ARGS=(
         --body-ang-p99 8.0 --joint-vel-p99 7.0
         --base-lin-p99 1.8 --base-ang-p99 2.5
@@ -44,7 +70,7 @@ if [[ -z "${NPZ_DIR:-}" ]]; then
       FILTER_ARGS=()
       ;;
     *)
-      echo "ERROR: CURRICULUM_STAGE must be 1, 2, 3, or full" >&2
+      echo "ERROR: CURRICULUM_STAGE must be 1, 2, 2.5, 3, or full" >&2
       exit 2
       ;;
   esac
@@ -52,9 +78,45 @@ if [[ -z "${NPZ_DIR:-}" ]]; then
   if [[ "$CURRICULUM_STAGE" == "full" ]]; then
     NPZ_DIR="$SOURCE_NPZ_DIR"
   else
-    NPZ_DIR="$WORK_DIR/gr2_stage${CURRICULUM_STAGE}"
+    FILTER_SOURCE_DIR="$SOURCE_NPZ_DIR"
+    STAGE_DIR_SUFFIX="${CURRICULUM_STAGE//./_}"
+    if [[ "$CURRICULUM_STAGE" == "2.5" ]]; then
+      FILTER_SOURCE_DIR="$WORK_DIR/gr2_stage2_5_source"
+      mkdir -p "$FILTER_SOURCE_DIR"
+      for existing in "$FILTER_SOURCE_DIR"/*.npz; do
+        [[ -e "$existing" || -L "$existing" ]] || continue
+        if [[ ! -L "$existing" ]]; then
+          echo "ERROR: refusing to replace real file in $FILTER_SOURCE_DIR: $existing" >&2
+          exit 1
+        fi
+        rm "$existing"
+      done
+      MERGED_CLIPS=0
+      for source_dir in "$SOURCE_NPZ_DIR" "$MANIPULATION_NPZ_DIR"; do
+        if [[ ! -d "$source_dir" ]]; then
+          echo "ERROR: motion source directory does not exist: $source_dir" >&2
+          exit 1
+        fi
+        SOURCE_CLIPS=("$source_dir"/*.npz)
+        if [[ ! -e "${SOURCE_CLIPS[0]}" ]]; then
+          echo "ERROR: no NPZ clips in motion source: $source_dir" >&2
+          exit 1
+        fi
+        for source in "${SOURCE_CLIPS[@]}"; do
+          target="$FILTER_SOURCE_DIR/${source##*/}"
+          if [[ -e "$target" || -L "$target" ]]; then
+            echo "ERROR: duplicate NPZ filename while merging Stage 2.5: ${source##*/}" >&2
+            exit 1
+          fi
+          ln -s "$source" "$target"
+          ((++MERGED_CLIPS))
+        done
+      done
+      echo "merged $MERGED_CLIPS motion clips -> $FILTER_SOURCE_DIR"
+    fi
+    NPZ_DIR="$WORK_DIR/gr2_stage${STAGE_DIR_SUFFIX}"
     uv run --no-sync python scripts/motion/filter_calm_gr2.py \
-      --src "$SOURCE_NPZ_DIR" --dst "$NPZ_DIR" --show-dropped 0 \
+      --src "$FILTER_SOURCE_DIR" --dst "$NPZ_DIR" --show-dropped 0 \
       "${FILTER_ARGS[@]}"
   fi
 fi
@@ -69,7 +131,7 @@ fi
 
 # Keep the 3000+ paths out of argv (Linux MAX_ARG_STRLEN) by composing a
 # temporary Hydra config through hydra.searchpath.
-MOTION_OVERRIDE_NAME="gr2_stage_${CURRICULUM_STAGE}_$$"
+MOTION_OVERRIDE_NAME="gr2_stage_${CURRICULUM_STAGE//./_}_$$"
 MOTION_OVERRIDE_FILE="$WORK_DIR/motion_override/$MOTION_OVERRIDE_NAME.yaml"
 {
   echo "# @package _global_"
@@ -109,13 +171,17 @@ TRAIN_ARGS=(
   task=gr2_motion_tracking/sonic_full_train
   training.device=xpu
   training.no_play=true
-  algo.actor.distribution_cfg.init_std=0.50
+  "algo.actor.distribution_cfg.init_std=$INIT_STD"
   "${RESUME_ARGS[@]}"
-  algo.algorithm.learning_rate=2e-5
-  algo.algorithm.entropy_coef=0.004
+  "algo.algorithm.learning_rate=$LEARNING_RATE"
+  "algo.algorithm.entropy_coef=$ENTROPY_COEF"
   algo.algorithm.desired_kl=0.01
-  algo.algorithm.adaptive_lr_max=2e-4
+  "algo.algorithm.adaptive_lr_max=$ADAPTIVE_LR_MAX"
   "algo.num_steps_per_env=$NUM_STEPS"
+  "reward.scales.motion_global_root_pos=$ROOT_POS_SCALE"
+  "reward.scales.action_rate_l2=$ACTION_RATE_L2_SCALE"
+  "reward.scales.target_rate_l2=$TARGET_RATE_L2_SCALE"
+  "reward.scales.upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE"
   reward.scales.joint_acc_l2=-2.5e-7
   reward.scales.joint_torque_l2=-1.0e-6
   reward.scales.anti_shake_ang_vel=-2.5e-3
@@ -130,7 +196,7 @@ TRAIN_ARGS=(
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   uv run --no-sync python scripts/train_rsl_rl.py "${TRAIN_ARGS[@]}" --cfg job >/dev/null
-  echo "Hydra compose passed (stage=$CURRICULUM_STAGE, clips=${#NPZ_FILES[@]})"
+  echo "Hydra compose passed (stage=$CURRICULUM_STAGE, clips=${#NPZ_FILES[@]}, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, init_std=$INIT_STD)"
   exit 0
 fi
 
@@ -138,4 +204,4 @@ LOG="$WORK_DIR/full_train_gr2_stage${CURRICULUM_STAGE}_$(date +%Y%m%d_%H%M%S).lo
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 setsid nohup uv run --no-sync python scripts/train_rsl_rl.py "${TRAIN_ARGS[@]}" \
   > "$LOG" 2>&1 < /dev/null &
-echo "launched GR2 stage $CURRICULUM_STAGE (${#NPZ_FILES[@]} clips), log=$LOG"
+echo "launched GR2 stage $CURRICULUM_STAGE (${#NPZ_FILES[@]} clips, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, init_std=$INIT_STD), log=$LOG"

@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import mujoco
 import numpy as np
@@ -111,6 +112,40 @@ def test_gr2_sonic_action_scale_matches_actuator_contract() -> None:
     np.testing.assert_allclose(cfg.control_config.action_scale, 0.25 * effort / kp)
 
 
+def test_gr2_sonic_target_rate_uses_physical_position_targets() -> None:
+    env = GR2SonicMotionTrackingEnv(GR2SonicMotionTrackingCfg(), num_envs=1)
+    current = np.linspace(-1.0, 1.0, 27, dtype=np.float32)[None, :]
+    last = np.linspace(0.5, -0.5, 27, dtype=np.float32)[None, :]
+    ctx = SimpleNamespace(
+        info={"current_actions": current, "last_actions": last},
+        joint_error=np.empty_like(current),
+        env_error=np.empty((1,), dtype=np.float32),
+    )
+
+    actual = env._reward_target_rate_l2(ctx).copy()
+    expected = np.sum(np.square((current - last) * env._cfg.control_config.action_scale), axis=1)
+
+    np.testing.assert_allclose(actual, expected)
+
+
+def test_gr2_sonic_upper_body_reward_covers_14_arm_joints() -> None:
+    env = GR2SonicMotionTrackingEnv(GR2SonicMotionTrackingCfg(), num_envs=1)
+    reference = np.zeros((1, 27), dtype=np.float32)
+    actual_pos = np.zeros_like(reference)
+    actual_pos[:, env._upper_body_dof_indices] = 0.2
+    ctx = SimpleNamespace(
+        motion_data=SimpleNamespace(joint_pos=reference),
+        dof_pos=actual_pos,
+        env_error=np.empty((1,), dtype=np.float32),
+        reward_term=np.empty((1,), dtype=np.float32),
+    )
+
+    actual = env._reward_upper_body_joint_pos(ctx).copy()
+
+    assert env._upper_body_dof_indices.size == 14
+    np.testing.assert_allclose(actual, [np.exp(-1.0)], rtol=1e-6)
+
+
 def test_gr2_sonic_linear_velocity_sensor_uses_imu_frame() -> None:
     model = mujoco.MjModel.from_xml_path(str(_ASSET_DIR / "scene_sonic_27dof.xml"))
     data = mujoco.MjData(model)
@@ -148,3 +183,20 @@ def test_gr2_sonic_env_reset_and_step_shapes_are_finite() -> None:
     assert state.obs["critic"].shape == (1, 1545)
     assert all(np.isfinite(value).all() for value in state.obs.values())
     assert np.isfinite(state.reward).all()
+    assert {
+        "termination/anchor_height",
+        "termination/anchor_tilt",
+        "termination/end_effector_height",
+        "termination/undesired_contact",
+        "termination/strict_anchor_height",
+        "termination/strict_end_effector_height",
+        "termination/strict_anchor_orientation",
+        "termination/strict_foot_position",
+        "termination/any",
+        "truncation/time_limit",
+        "truncation/clip_end",
+        "truncation/any",
+        "episode_end/any",
+        "diagnostic/estimated_torque_saturation_ratio",
+        "diagnostic/estimated_upper_body_torque_saturation_ratio",
+    } <= state.info["log"].keys()
