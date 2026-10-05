@@ -213,8 +213,8 @@ Important defaults and launcher overrides are:
 | maximum iterations | 20000 | launcher |
 | checkpoint interval | 100 | launcher |
 | initial action std | 0.50 | launcher; checkpoint value is restored on resume |
-| learning rate | `2e-5` (`1e-5` for Stage 2.5) | launcher |
-| entropy coefficient | `0.004` (`0.003` for Stage 2.5) | launcher |
+| learning rate | stage-dependent (`7.5e-6` for Stage 2.8) | launcher |
+| entropy coefficient | stage-dependent (`0.001` for Stage 2.8) | launcher |
 | desired KL | `0.01` | launcher |
 | adaptive maximum learning rate | `2e-4` | launcher |
 
@@ -355,7 +355,7 @@ standard deviation, per-term unweighted rewards, weighted torque contribution, j
 limits, foot contact-height gates, and actuator saturation. GR2 is substantially heavier
 than G1, so G1 torque-penalty magnitudes are not directly transferable.
 
-### 5.4 Continue with Stage 2, Stage 2.5, Stage 3, and full data
+### 5.4 Continue with Stage 2, Stage 2.5, Stage 2.8, Stage 3, and full data
 
 For every stage after Stage 1, provide the previous run directory name through `LOAD_RUN`.
 The launcher finds and resumes its numerically latest `model_*.pt`.
@@ -396,11 +396,46 @@ TensorBoard rollout logs include overlapping per-step termination rates under
 implied by the fixed GR2 action-scale contract; they are estimates, not measured
 actuator-force telemetry.
 
-Continue Stage 3 from the new Stage 2.5 run:
+Stage 2.8 merges the same base and upright-manipulation sources, then admits moderately
+more dynamic clips than Stage 2.5. To resume the exact checkpoint instead of the newest
+checkpoint in the run directory:
 
 ```bash
-STAGE2_5_RUN=<stage-2.5-run-directory>
-SOURCE_NPZ_DIR="$NPZ_DIR" CURRICULUM_STAGE=3 LOAD_RUN="$STAGE2_5_RUN" \
+CURRICULUM_STAGE=2.8 \
+LOAD_RUN=2026-09-30_22-45-21_mujoco CHECKPOINT=7900 \
+STRICT_FOOT_POS_THRESHOLD=0.50 \
+STRICT_ANCHOR_ORI_ERROR_SQ=0.80 \
+STRICT_HEIGHT_THRESHOLD=0.45 \
+MAX_ITERATIONS=5000 ./scripts/sonic/full_train_gr2.sh
+```
+
+Its defaults are `learning_rate=7.5e-6`, `adaptive_lr_max=1e-5`,
+`entropy_coef=0.001`, `motion_global_root_pos=0.75`, `action_rate_l2=0`,
+`target_rate_l2=-0.02`, `upper_body_joint_pos=1.0`, and
+`anti_shake_ang_vel=0`. The reduced smoothness penalties avoid suppressing the faster
+wrist references admitted by this stage. The generated subset is stored under
+`/tmp/sonic_train/gr2_stage2_8`.
+
+Stage 2.8 also defaults to `FOCUS_PATTERN='*macarena*.npz'` and
+`FOCUS_REPEAT=5`. In the current filtered subset this matches 34 clips and raises their
+frame-weighted probability under mixed sampling from `1.65%` to `7.73%`. Repetition
+duplicates paths only in the generated Hydra motion list; it does not copy NPZ files.
+Set `FOCUS_REPEAT=1` to disable focus oversampling.
+
+Stage 2.8 keeps the permissive Stage 2.5 termination gates while the policy adapts to
+the broader distribution. Stage 3 defaults to `strict_foot_pos_threshold=0.45`,
+`strict_anchor_ori_error_sq=0.70`, and `strict_height_threshold=0.40`. The orientation
+value is squared geodesic error: `0.80` and `0.70` correspond to approximately `51.2`
+and `47.9` degrees. These gates prevent collapsed tracking; they are not precision
+targets.
+
+Continue Stage 3 from the Stage 2.8 run:
+
+```bash
+STAGE2_8_RUN=<stage-2.8-run-directory>
+SOURCE_NPZ_DIR="$NPZ_DIR" CURRICULUM_STAGE=3 LOAD_RUN="$STAGE2_8_RUN" \
+STRICT_FOOT_POS_THRESHOLD=0.45 STRICT_ANCHOR_ORI_ERROR_SQ=0.70 \
+STRICT_HEIGHT_THRESHOLD=0.40 \
   ./scripts/sonic/full_train_gr2.sh
 ```
 
@@ -419,6 +454,7 @@ The automatic filter limits are:
 | 1 | 6.5 | 5.5 | 1.35 | 2.0 | 0.15 | 0.35 |
 | 2 | 8.0 | 7.0 | 1.8 | 2.5 | 0.25 | 0.45 |
 | 2.5 | 8.0 | 7.0 | 1.8 | 2.5 | 0.25 | 0.45 |
+| 2.8 | 10.0 | 8.5 | 2.0 | 3.5 | 0.30 | 0.55 |
 | 3 | 12.0 | 9.5 | 2.2 | 4.0 | 0.35 | 0.65 |
 | full | no filter | no filter | no filter | no filter | no filter | no filter |
 
@@ -429,17 +465,24 @@ The launcher accepts these environment variables:
 | Variable | Default | Meaning |
 |---|---|---|
 | `SOURCE_NPZ_DIR` | repository-local development path | complete 27-DoF motion source |
-| `MANIPULATION_NPZ_DIR` | repository-local upright-operations path | motions added during Stage 2.5 |
+| `MANIPULATION_NPZ_DIR` | repository-local upright-operations path | motions added during Stages 2.5 and 2.8 |
 | `NPZ_DIR` | unset | bypass automatic filtering and use this directory directly |
-| `CURRICULUM_STAGE` | `1` | `1`, `2`, `2.5`, `3`, or `full` |
+| `CURRICULUM_STAGE` | `1` | `1`, `2`, `2.5`, `2.8`, `3`, or `full` |
 | `LOAD_RUN` | unset | prior run directory; required after Stage 1 |
-| `LEARNING_RATE` | stage-dependent | `1e-5` for Stage 2.5; otherwise `2e-5` |
-| `ADAPTIVE_LR_MAX` | `2e-4` | maximum shared LR under adaptive-KL scheduling |
-| `ENTROPY_COEF` | stage-dependent | `0.003` for Stage 2.5; otherwise `0.004` |
-| `ROOT_POS_SCALE` | stage-dependent | `0.75` for Stage 2.5; otherwise `0.5` |
-| `ACTION_RATE_L2_SCALE` | stage-dependent | `0` for Stage 2.5; otherwise `-0.01` |
-| `TARGET_RATE_L2_SCALE` | stage-dependent | `-0.05` for Stage 2.5; otherwise `0` |
-| `UPPER_BODY_JOINT_POS_SCALE` | stage-dependent | `0.5` for Stage 2.5; otherwise `0` |
+| `CHECKPOINT` | unset | exact checkpoint number/name; newest checkpoint is used when unset |
+| `LEARNING_RATE` | stage-dependent | `7.5e-6` for Stage 2.8 |
+| `ADAPTIVE_LR_MAX` | stage-dependent | `1e-5` for Stage 2.8; otherwise `2e-4` |
+| `ENTROPY_COEF` | stage-dependent | `0.001` for Stage 2.8 |
+| `ROOT_POS_SCALE` | stage-dependent | `0.75` for Stages 2.5 and 2.8 |
+| `ACTION_RATE_L2_SCALE` | stage-dependent | `0` for Stages 2.5 and 2.8 |
+| `TARGET_RATE_L2_SCALE` | stage-dependent | `-0.02` for Stage 2.8 |
+| `UPPER_BODY_JOINT_POS_SCALE` | stage-dependent | `1.0` for Stage 2.8 |
+| `ANTI_SHAKE_ANG_VEL_SCALE` | stage-dependent | `0` for Stage 2.8; otherwise `-2.5e-3` |
+| `FOCUS_PATTERN` | stage-dependent | `*macarena*.npz` for Stage 2.8; unset otherwise |
+| `FOCUS_REPEAT` | stage-dependent | `5` for Stage 2.8; `1` disables focus oversampling |
+| `STRICT_FOOT_POS_THRESHOLD` | stage-dependent | `0.50` for Stage 2.8; `0.45` for Stage 3 |
+| `STRICT_ANCHOR_ORI_ERROR_SQ` | stage-dependent | `0.80` for Stage 2.8; `0.70` for Stage 3 |
+| `STRICT_HEIGHT_THRESHOLD` | stage-dependent | `0.45` for Stage 2.8; `0.40` for Stage 3 |
 | `INIT_STD` | `0.50` | construction value; restored actor std wins on resume |
 | `NUM_ENVS` | `4096` | parallel environments |
 | `NUM_STEPS` | `24` | rollout steps per environment |
