@@ -9,8 +9,12 @@ The same SONIC core is also used by G1 and H2, with robot-specific dimensions:
 | Robot | Encoder input | Proprio | Actor input | Actions | Critic |
 |---|---:|---:|---:|---:|---:|
 | G1 | 640 | 930 | 1570 | 29 | 1645 |
-| H2 | 680 | 990 | 1670 | 31 | 1745 |
+| H2 head-welded | 640 | 930 | 1570 | 29 | 1645 |
 | GR2 fixed-head | 600 | 870 | 1470 | 27 | 1545 |
+
+H2's head is welded (no head joints/actuators), so its joint set matches Unitree G1
+exactly and all SONIC dimensions are identical to G1. H2-specific setup and the (small)
+differences from the GR2 flow are in [Section 8](#8-h2-training-differences-from-gr2).
 
 GR2 and H2 split ONNX export is supported and numerically checked against the PyTorch
 model. All commands below run from the UniLab repository root:
@@ -567,3 +571,116 @@ uv run --no-sync pytest tests/config/test_config_system.py -q
 | Reward is unstable | Inspect termination reasons, action std, torque contribution, limits, and saturation before changing aggregate reward scales. |
 | ONNX load has size mismatches | Confirm `--robot` matches the checkpoint robot and action width. |
 | `--merged-1762` is rejected | This buffer layout is G1-only; export H2/GR2 split graphs without it. |
+
+## 8. H2 Training (differences from GR2)
+
+H2 uses the same SONIC core, curriculum launcher, and from-scratch philosophy as GR2.
+This section lists only what differs; everything else (environment setup, monitoring,
+curriculum stages, checkpoint/resume, torque diagnostics, split ONNX export) follows the
+GR2 sections above unchanged.
+
+### 8.1 Joint contract
+
+H2's head is welded (no head joints/actuators; the head bodies stay for rendering only),
+so H2 exposes **29 controlled joints**, identical to Unitree G1:
+
+```text
+left/right legs, 6 each          12
+waist yaw, roll, pitch            3
+left/right arms, 7 each          14
+                                  --
+total                             29
+```
+
+This differs from GR2's 27-DoF profile, which keeps only `waist_yaw` (1) and drops waist
+roll/pitch. The widths that must stay equal throughout the H2 pipeline are:
+
+```text
+MuJoCo scalar joints = actuators = NPZ joints = action scale = policy actions = 29
+```
+
+H2 actor contract: encoder `640 = 10·(2·29 + 6)`, proprio `930 = 10·(3 + 3·29 + 3)`,
+actor `1570`, decoder `token 64 + proprio 930 = 994`, action `29`, privileged critic
+`1645`. These equal G1; they are **not** the pre-weld 31-DoF values (680/990/1670/31/1745).
+
+The training asset is `src/unilab/assets/robots/h2/scene_flat.xml` (29-DoF; head welded).
+Do not load the G1 `last.pt` — H2 trains from scratch like GR2.
+
+### 8.2 Robot-specific names and constants (vs GR2)
+
+| Aspect | GR2 | H2 |
+|---|---|---|
+| Controlled joints | 27 (waist_yaw only) | 29 (waist yaw/roll/pitch) |
+| Anchor body | `base` | `pelvis` |
+| Foot body | `*_foot_roll_link` | `*_ankle_roll_link` |
+| Training asset | `gr2/scene_sonic_27dof.xml` | `h2/scene_flat.xml` |
+| Retarget script | `g1_csv_to_gr2_npz.py` | `g1_csv_to_h2_npz2.py` |
+| Calm filter | `filter_calm_gr2.py` | `filter_calm_h2.py` |
+| Launcher | `full_train_gr2.sh` | `full_train_h2.sh` |
+| Run directory | `logs/rsl_rl_ppo/GR2SonicMotionTracking/` | `logs/rsl_rl_ppo/H2SonicMotionTracking/` |
+| NPZ `body_names` metadata | present | absent (filter resolves indices from the model) |
+| `feet_contact_height` | 0.08 | 0.15 |
+| Actuator effort | manufacturer GR2 | ≈ 3× G1 (watch `joint_torque_l2`) |
+
+### 8.3 Retarget G1 CSV to H2 29-DoF NPZ
+
+H2 retargeting is task-space IK (not an explicit joint map like GR2). It scales the body
+targets anisotropically — leg-length ratio horizontally, pelvis-height ratio vertically —
+**plus a separate arm-length ratio for the distal arm bodies** (so hand reach follows H2's
+proportions, important for arm-heavy clips like macarena), and temporally smooths the
+floor-projection lift so the exported root vertical velocity has no per-frame spikes.
+
+```bash
+CSV_DIR=/path/to/bones-seed/g1/csv
+NPZ_DIR=/path/to/npz_h2_29dof
+
+uv run --no-sync python scripts/motion/g1_csv_to_h2_npz2.py \
+  --input "$CSV_DIR" --output "$NPZ_DIR" \
+  --input_fps 120 --output_fps 50 --skip_existing
+```
+
+Scales (`arm_scale`, `h_scale`, `v_scale`) are auto-derived from the two robots' standing
+kinematics; `--ground_smooth` (default 5) sets the lift-smoothing window. Validate one clip
+with `scripts/motion/replay_npz.py` and the H2 model before a large run. Output is 29-wide
+`joint_pos`/`joint_vel`; the body arrays are indexed by MuJoCo body id (no `body_names`
+key — the H2 filter resolves pelvis/foot indices from the model).
+
+The default standing motion `src/unilab/assets/motions/h2/stand.npz` is also 29-DoF; if you
+re-weld or change the model, regenerate it from the keyframe.
+
+### 8.4 Curriculum launcher
+
+`scripts/sonic/full_train_h2.sh` mirrors `full_train_gr2.sh` (same stages, filter limits,
+manipulation merge, resume, DRY_RUN, and env-var overrides from Section 5.5), driving
+`H2SonicMotionTracking` and `filter_calm_h2.py`. Defaults:
+
+```text
+SOURCE_NPZ_DIR         ~/work/sonic_vla_infer/bones_seed_3k_new/npz_h2_29dof
+MANIPULATION_NPZ_DIR   ~/work/sonic_vla_infer/bones-seed/selections/upright_nzp_h2_29dof
+```
+
+```bash
+# Stage 1 (from scratch)
+SOURCE_NPZ_DIR="$NPZ_DIR" CURRICULUM_STAGE=1 ./scripts/sonic/full_train_h2.sh
+# later stages require LOAD_RUN, exactly as GR2
+SOURCE_NPZ_DIR="$NPZ_DIR" CURRICULUM_STAGE=2 LOAD_RUN=<stage1-run> ./scripts/sonic/full_train_h2.sh
+```
+
+Two launcher behaviors differ from GR2:
+
+- **macarena focus is advisory, not fatal.** Stage 2/2.5/3/full default to
+  `FOCUS_PATTERN='*macarena*.npz'`, `FOCUS_REPEAT=5`; Stage 1 disables it. Because macarena
+  clips have `body_ang_p99 >= 8.25`, the calm filters drop them entirely at Stage 1 (6.5)
+  and Stage 2/2.5 (8.0); they re-enter only at Stage 2.8 (>=10, ~38/86) and Stage 3/full
+  (>=12, all). When a focus pattern matches nothing the launcher prints a **warning and
+  continues** (GR2 errors out), so Stage 1/2 run cleanly with no macarena to oversample.
+- The smoothness terms `joint_acc_l2 = -2.5e-7` and `joint_torque_l2 = -1.0e-6` are passed
+  as on GR2, but H2's effort is ≈3× G1, so `joint_torque_l2`'s raw magnitude is ≈9× larger;
+  monitor `reward/joint_torque_l2` and lower it (≈ `-1e-7`) if it approaches the tracking
+  terms.
+
+### 8.5 Export split ONNX
+
+Identical to GR2 but with `--robot h2`; H2 uses the single MuJoCo joint order (identity
+permutation), producing `model_encoder_h2.onnx` (`[1,640] -> [1,64]`) and
+`model_decoder.onnx` (`[1,994] -> [1,29]`). `--merged-1762` remains G1-only.

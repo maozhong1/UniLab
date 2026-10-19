@@ -1,4 +1,4 @@
-"""Motion tracking environments for Unitree H2 (31-DOF)."""
+"""Motion tracking environments for Unitree H2 (29-DOF, head welded like Unitree G1)."""
 
 from .tracking_sonic import H2SonicMotionTrackingCfg, H2SonicMotionTrackingEnv
 

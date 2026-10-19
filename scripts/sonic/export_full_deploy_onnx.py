@@ -87,7 +87,7 @@ except Exception:  # pragma: no cover - fallback keeps the exporter standalone
 
 ROBOT_DIMS = {
     "g1": (640, 930, 29),
-    "h2": (680, 990, 31),
+    "h2": (640, 930, 29),  # head welded -> identical joint set / dims to G1
     "gr2": (600, 870, 27),
 }
 

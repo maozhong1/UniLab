@@ -1,12 +1,12 @@
 # @package _global_
 #
-# SONIC H2 from-scratch full-train task: H2SonicMotionTracking env (31-DOF) + sonic
-# H2 encoder(+FSQ)+decoder actor + privileged_mf_hist critic. Forked from
-# g1_motion_tracking/sonic_full_train.yaml. Launch via scripts/sonic/full_train_h2.sh
+# SONIC H2 from-scratch full-train task: H2SonicMotionTracking env (29-DOF, head welded
+# like Unitree G1) + sonic H2 encoder(+FSQ)+decoder actor + privileged_mf_hist critic.
+# Forked from g1_motion_tracking/sonic_full_train.yaml. Launch via scripts/sonic/full_train_h2.sh
 # (passes +env.critic_privileged_mf_hist=true and +env.motion_file=[...]).
 #
-# The env emits a single 1670-dim actor stream ``obs`` = enc(680) ++ proprio(990);
-# SonicH2ActorModel splits it internally (proprio_group=null). Critic = 1745
+# The env emits a single 1570-dim actor stream ``obs`` = enc(640) ++ proprio(930);
+# SonicH2ActorModel splits it internally (proprio_group=null). Critic = 1645
 # privileged_mf_hist (enabled by the launcher override), trained fresh.
 training:
   task_name: H2SonicMotionTracking
@@ -18,15 +18,15 @@ algo:
   save_interval: 500
   obs_groups:
     actor:
-      - actor        # the 1670-dim env "obs" stream (mapped to tensordict key "actor")
+      - actor        # the 1570-dim env "obs" stream (mapped to tensordict key "actor")
     critic:
-      - critic       # 1745-dim privileged_mf_hist critic
+      - critic       # 1645-dim privileged_mf_hist critic
   actor:
     class_name: unilab.algos.torch.sonic:SonicH2ActorModel
     enc_group: actor         # single combined stream ...
-    proprio_group: null      # ... split internally into enc(680) + proprio(990)
-    enc_dim: 680
-    proprio_dim: 990
+    proprio_group: null      # ... split internally into enc(640) + proprio(930)
+    enc_dim: 640
+    proprio_dim: 930
     use_fsq: true
     with_kin_aux: false
     freeze_encoder: false
@@ -38,7 +38,7 @@ algo:
       std_type: scalar
   critic:
     # SonicCriticModel == stock MLPModel when pretrained_ckpt is unset (fresh critic).
-    # With env.critic_privileged_mf_hist=true the critic obs is the 1745-d H2
+    # With env.critic_privileged_mf_hist=true the critic obs is the 1645-d H2
     # privileged_mf_hist layout (joint blocks in MuJoCo order, self-consistent for a
     # fresh critic). Same 6-layer SiLU net as G1 full-train.
     class_name: unilab.algos.torch.sonic:SonicCriticModel
@@ -49,6 +49,8 @@ algo:
     entropy_coef: 0.005
 env:
   sim_dt: 0.005
+  # 1645-d privileged_mf_hist critic (declared so the launcher can set it without +).
+  critic_privileged_mf_hist: true
   # from-scratch: single MuJoCo joint order (no last.pt reuse)
   mujoco_to_isaaclab_perm: false
   action_output_isaaclab_to_mujoco: false
@@ -72,11 +74,21 @@ reward:
     motion_joint_vel: 0.0
     action_rate_l2: -0.03          # -0.01 -> -0.03  (ep-len>100, add smoothness vs jitter)
     joint_limit: -10.0
+    # Curriculum terms (launcher enables from stage 2.5): target_rate_l2 penalizes the
+    # physical PD-target change (action_scale·Δaction, replaces action_rate_l2 once stable);
+    # upper_body_joint_pos tracks the 14 shoulder/elbow/wrist joints. Default 0.0 = OFF.
+    target_rate_l2: 0.0
+    upper_body_joint_pos: 0.0
     # Foot-slip / foot-yaw penalties (H2 single foot-mesh has no torsional friction ->
     # support foot free-spins on turns, wrecking motion_body_ang_vel). Declared here so
     # per-run CLI (reward.scales.feet_slide=... ) can override; default 0.0 = OFF.
     feet_slide: 0.0
     feet_yaw: 0.0
+    # Smoothness terms (launcher overrides these per stage). Must be declared here so the
+    # composed reward.scales struct contains the keys for CLI override.
+    joint_acc_l2: -2.5e-7
+    joint_torque_l2: -1.0e-6
+    anti_shake_ang_vel: -5.0e-3
   std_root_pos: 0.3
   std_root_ori: 0.4
   std_body_pos: 0.3
@@ -84,6 +96,7 @@ reward:
   std_body_lin_vel: 1.0
   std_body_ang_vel: 3.14
   std_joint_pos: 0.2
+  std_upper_body_joint_pos: 0.2
   std_joint_vel: 1.0
 play_profile:
   enabled: true

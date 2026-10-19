@@ -1,133 +1,272 @@
 #!/usr/bin/env python3
-"""Filter H2 motion npz clips by angular-velocity "violence" for curriculum training.
+"""Build the H2 curriculum motion subset for from-scratch SONIC training.
 
-Why: the H2 SONIC clips are dance motions with fast spins (chaines / 180-turns) whose
-reference body angular velocity peaks at 8-19 rad/s. A torque/bandwidth-limited humanoid
-cannot reproduce those spins while staying upright, so motion_body_ang_vel saturates at
-its "robot barely rotates" floor (~0.16) regardless of reward/contact tuning. Training a
-curriculum stage on the *calm* subset lifts ang_vel tracking and stabilizes learning far
-more than any reward knob.
+This is the 6-metric successor to the old single-``--metric/--thresh`` H2 filter, matching
+``filter_calm_gr2.py``'s interface so ``full_train_h2.sh`` can drive both robots the same
+way. It uses several independent limits so fast turns, joint-speed spikes, jumps, and high
+kicks cannot pass solely because one aggregate angular-velocity statistic is low.
 
-This tool scans a directory of *.npz clips, computes a per-clip angular-velocity metric
-over ``body_ang_vel_w`` (all bodies, all frames), prints the distribution so you can pick
-a threshold, and materializes a "calm" subset as symlinks (default) or copies. The
-training launcher just points NPZ_DIR at the output dir.
+Inputs are H2-retargeted NPZ files produced by ``g1_csv_to_h2_npz2.py``. Those NPZ files do
+NOT carry ``body_names`` metadata, and their body arrays are indexed by MuJoCo body id, so
+the pelvis/foot indices are resolved once from the H2 model (cold path).
 
 Examples:
-  # 1) just report the distribution, pick a threshold:
-  uv run --no-sync python scripts/motion/filter_calm_h2.py --src /path/npz_h2_new --dry-run
-  # 2) materialize clips with per-clip p99 |w| <= 8 rad/s as symlinks:
   uv run --no-sync python scripts/motion/filter_calm_h2.py \
-      --src /path/npz_h2_new --dst /path/npz_h2_calm --metric p99 --thresh 8.0
+      --src /path/to/npz_h2_29dof --dry-run
+  uv run --no-sync python scripts/motion/filter_calm_h2.py \
+      --src /path/to/npz_h2_29dof --dst /path/to/npz_h2_29dof_calm
 """
+
 from __future__ import annotations
 
 import argparse
-import glob
-import os
+import csv
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
+import mujoco
 import numpy as np
 
-_METRICS = ("p99", "p95", "max", "mean")
+from unilab.assets import ASSETS_ROOT_PATH
+
+DEFAULT_H2_MODEL = str(ASSETS_ROOT_PATH / "robots" / "h2" / "scene_flat.xml")
+
+# H2 anchor + foot bodies (the npz body arrays are indexed by MuJoCo body id).
+_ANCHOR_BODY = "pelvis"
+_FOOT_BODIES = ("left_ankle_roll_link", "right_ankle_roll_link")
 
 
-def clip_metric(ang_vel_w: np.ndarray, metric: str) -> float:
-    """Reduce (T, B, 3) angular velocity to one scalar |w| statistic (rad/s)."""
-    mag = np.linalg.norm(ang_vel_w, axis=-1)  # (T, B) per-body-per-frame speed
-    if metric == "max":
-        return float(mag.max())
-    if metric == "mean":
-        return float(mag.mean())
-    pct = 99.0 if metric == "p99" else 95.0
-    return float(np.percentile(mag, pct))
+@dataclass(frozen=True)
+class Limits:
+    body_ang_p99: float
+    joint_vel_p99: float
+    base_lin_p99: float
+    base_ang_p99: float
+    base_z_range: float
+    foot_height_max: float
+
+
+@dataclass(frozen=True)
+class Metrics:
+    body_ang_p99: float
+    joint_vel_p99: float
+    base_lin_p99: float
+    base_ang_p99: float
+    base_z_range: float
+    foot_height_max: float
+
+
+@dataclass(frozen=True)
+class BodyIndices:
+    base: int
+    feet: tuple[int, ...]
+
+
+def _resolve_body_indices(model_file: str) -> BodyIndices:
+    """Resolve pelvis/foot body ids from the H2 model (npz body arrays use the same order)."""
+    model = mujoco.MjModel.from_xml_path(model_file)
+
+    def body_id(name: str) -> int:
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+        if bid < 0:
+            raise ValueError(f"body '{name}' not found in model {model_file}")
+        return bid
+
+    return BodyIndices(
+        base=body_id(_ANCHOR_BODY),
+        feet=tuple(body_id(name) for name in _FOOT_BODIES),
+    )
+
+
+def _percentile_magnitude(values: np.ndarray, percentile: float = 99.0) -> float:
+    return float(np.percentile(np.linalg.norm(values, axis=-1), percentile))
+
+
+def clip_metrics(path: Path, indices: BodyIndices) -> Metrics:
+    with np.load(path) as data:
+        required = {
+            "joint_vel",
+            "body_pos_w",
+            "body_lin_vel_w",
+            "body_ang_vel_w",
+        }
+        missing = sorted(required.difference(data.files))
+        if missing:
+            raise ValueError(f"missing NPZ keys: {', '.join(missing)}")
+
+        joint_vel = np.asarray(data["joint_vel"], dtype=np.float64)
+        body_pos = np.asarray(data["body_pos_w"], dtype=np.float64)
+        body_lin_vel = np.asarray(data["body_lin_vel_w"], dtype=np.float64)
+        body_ang_vel = np.asarray(data["body_ang_vel_w"], dtype=np.float64)
+
+    arrays = (joint_vel, body_pos, body_lin_vel, body_ang_vel)
+    if any(array.size == 0 for array in arrays):
+        raise ValueError("motion arrays must not be empty")
+    if not all(np.isfinite(array).all() for array in arrays):
+        raise ValueError("motion contains NaN or infinite values")
+
+    nbody = body_pos.shape[1]
+    max_index = max(indices.base, *indices.feet)
+    if max_index >= nbody:
+        raise ValueError(
+            f"body index {max_index} out of range for clip with {nbody} bodies "
+            "(wrong --h2_model_xml for this NPZ?)"
+        )
+
+    base_z = body_pos[:, indices.base, 2]
+    foot_z = body_pos[:, indices.feet, 2]
+
+    return Metrics(
+        body_ang_p99=_percentile_magnitude(body_ang_vel),
+        joint_vel_p99=float(np.percentile(np.abs(joint_vel), 99.0)),
+        base_lin_p99=_percentile_magnitude(body_lin_vel[:, indices.base]),
+        base_ang_p99=_percentile_magnitude(body_ang_vel[:, indices.base]),
+        base_z_range=float(np.ptp(base_z)),
+        foot_height_max=float(np.max(foot_z)),
+    )
+
+
+def rejection_reasons(metrics: Metrics, limits: Limits) -> list[str]:
+    reasons = []
+    for field in Metrics.__dataclass_fields__:
+        if getattr(metrics, field) > getattr(limits, field):
+            reasons.append(field)
+    return reasons
+
+
+def _distribution(rows: list[tuple[Path, Metrics, list[str]]]) -> None:
+    print("\nmetric distribution (per clip):")
+    for field in Metrics.__dataclass_fields__:
+        values = np.asarray([getattr(metrics, field) for _path, metrics, _reasons in rows])
+        quantiles = np.percentile(values, (0, 25, 50, 75, 90, 95, 100))
+        summary = ", ".join(
+            f"{name}={value:.3f}"
+            for name, value in zip(("min", "p25", "p50", "p75", "p90", "p95", "max"), quantiles)
+        )
+        print(f"  {field:18s} {summary}")
+
+
+def _write_report(path: Path, rows: list[tuple[Path, Metrics, list[str]]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = list(Metrics.__dataclass_fields__)
+    with path.open("w", newline="", encoding="utf-8") as report_file:
+        writer = csv.writer(report_file)
+        writer.writerow(("file", "keep", "reasons", *fields))
+        for source, metrics, reasons in rows:
+            writer.writerow(
+                (
+                    source.name,
+                    not reasons,
+                    ";".join(reasons),
+                    *(f"{getattr(metrics, field):.8g}" for field in fields),
+                )
+            )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--src", required=True, help="directory of H2 NPZ clips")
+    parser.add_argument("--dst", help="calm subset directory (default: <src>_calm)")
+    parser.add_argument("--h2_model_xml", default=DEFAULT_H2_MODEL,
+                        help="H2 scene XML used to resolve pelvis/foot body indices")
+    parser.add_argument("--body-ang-p99", type=float, default=6.5, metavar="RAD_S")
+    parser.add_argument("--joint-vel-p99", type=float, default=5.5, metavar="RAD_S")
+    parser.add_argument("--base-lin-p99", type=float, default=1.35, metavar="M_S")
+    parser.add_argument("--base-ang-p99", type=float, default=2.0, metavar="RAD_S")
+    parser.add_argument("--base-z-range", type=float, default=0.15, metavar="M")
+    parser.add_argument("--foot-height-max", type=float, default=0.35, metavar="M")
+    parser.add_argument("--copy", action="store_true", help="copy instead of symlink")
+    parser.add_argument("--dry-run", action="store_true", help="scan without writing")
+    parser.add_argument("--show-dropped", type=int, default=20)
+    parser.add_argument("--report", help="CSV report path (default: <dst>/filter_report.csv)")
+    return parser.parse_args()
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--src", required=True, help="dir of source *.npz clips")
-    ap.add_argument("--dst", default=None, help="output dir for the calm subset (default: <src>_calm)")
-    ap.add_argument("--metric", default="p99", choices=_METRICS, help="per-clip |w| statistic (default p99)")
-    ap.add_argument("--thresh", type=float, default=8.0, help="keep clips with metric <= thresh rad/s (default 8.0)")
-    ap.add_argument("--copy", action="store_true", help="copy files instead of symlinking")
-    ap.add_argument("--dry-run", action="store_true", help="report distribution only; do not write anything")
-    args = ap.parse_args()
-
-    src = Path(args.src).expanduser().resolve()
-    files = sorted(glob.glob(str(src / "*.npz")))
+    args = parse_args()
+    source_dir = Path(args.src).expanduser().resolve()
+    files = sorted(source_dir.glob("*.npz"))
     if not files:
-        raise SystemExit(f"no *.npz under {src}")
+        raise SystemExit(f"no *.npz files under {source_dir}")
 
-    # ── scan ──────────────────────────────────────────────────────────
-    vals: list[float] = []
-    names: list[str] = []
-    skipped: list[str] = []
-    for f in files:
+    indices = _resolve_body_indices(args.h2_model_xml)
+    limits = Limits(
+        body_ang_p99=args.body_ang_p99,
+        joint_vel_p99=args.joint_vel_p99,
+        base_lin_p99=args.base_lin_p99,
+        base_ang_p99=args.base_ang_p99,
+        base_z_range=args.base_z_range,
+        foot_height_max=args.foot_height_max,
+    )
+    rows = []
+    invalid = []
+    for path in files:
         try:
-            z = np.load(f)
-            if "body_ang_vel_w" not in z:
-                skipped.append(f)
-                continue
-            vals.append(clip_metric(np.asarray(z["body_ang_vel_w"], dtype=np.float32), args.metric))
-            names.append(f)
-        except Exception as e:  # noqa: BLE001 - report and continue
-            print(f"  ! skip {os.path.basename(f)}: {e}")
-            skipped.append(f)
+            metrics = clip_metrics(path, indices)
+            rows.append((path, metrics, rejection_reasons(metrics, limits)))
+        except Exception as error:  # noqa: BLE001 - report each malformed clip and continue
+            invalid.append((path, str(error)))
 
-    v = np.asarray(vals)
-    n = v.size
-    print(f"\nscanned {n} clips from {src}  (skipped {len(skipped)})")
-    print(f"per-clip metric = {args.metric} of body |w| (rad/s)")
-    qs = [1, 5, 10, 25, 50, 75, 90, 95, 99]
-    print("  distribution:", {f"p{q}": round(float(np.percentile(v, q)), 2) for q in qs})
-    print(f"  min={v.min():.2f}  max={v.max():.2f}  mean={v.mean():.2f}")
+    if not rows:
+        raise SystemExit("no valid H2 NPZ clips found")
 
-    keep_mask = v <= args.thresh
-    n_keep = int(keep_mask.sum())
-    print(f"\nthreshold {args.metric} <= {args.thresh} rad/s  ->  keep {n_keep}/{n} "
-          f"({100.0 * n_keep / n:.1f}%), drop {n - n_keep}")
-    # show a few of the most-violent dropped clips (the ceiling-killers)
-    drop_order = np.argsort(-v)
-    print("  most-violent dropped (top 5):")
-    shown = 0
-    for i in drop_order:
-        if not keep_mask[i]:
-            print(f"    {v[i]:6.2f}  {os.path.basename(names[i])}")
-            shown += 1
-            if shown >= 5:
-                break
+    kept = [row for row in rows if not row[2]]
+    dropped = [row for row in rows if row[2]]
+    print(f"scanned {len(rows)} valid clips from {source_dir}; invalid={len(invalid)}")
+    print("limits:")
+    for field in Limits.__dataclass_fields__:
+        print(f"  {field:18s} <= {getattr(limits, field):g}")
+    _distribution(rows)
+    print(f"\nkeep {len(kept)}/{len(rows)} ({100.0 * len(kept) / len(rows):.1f}%); drop {len(dropped)}")
+
+    reason_counts = {
+        field: sum(field in reasons for _path, _metrics, reasons in dropped)
+        for field in Metrics.__dataclass_fields__
+    }
+    print("drop reason counts:")
+    for reason, count in reason_counts.items():
+        print(f"  {reason:18s} {count}")
+    if dropped:
+        print(f"dropped clips (first {args.show_dropped}):")
+        for path, _metrics, reasons in dropped[: args.show_dropped]:
+            print(f"  {path.name}: {', '.join(reasons)}")
+    for path, error in invalid:
+        print(f"  INVALID {path.name}: {error}")
 
     if args.dry_run:
-        print("\n[dry-run] nothing written. Re-run without --dry-run to materialize the subset.")
+        print("\n[dry-run] nothing written")
         return
-    if n_keep == 0:
-        raise SystemExit("threshold keeps 0 clips; raise --thresh")
+    if not kept:
+        raise SystemExit("limits keep zero clips; relax one or more thresholds")
 
-    dst = Path(args.dst) if args.dst else src.parent / f"{src.name}_calm"
-    dst = dst.expanduser().resolve()
-    if dst.exists():
-        # only clear symlinks/files we would have made; refuse to clobber a non-empty real dir
-        existing = list(dst.glob("*.npz"))
-        for p in existing:
-            if p.is_symlink() or args.copy:
-                p.unlink()
-    dst.mkdir(parents=True, exist_ok=True)
-
-    for i in np.nonzero(keep_mask)[0]:
-        srcf = Path(names[i])
-        dstf = dst / srcf.name
-        if dstf.exists() or dstf.is_symlink():
-            dstf.unlink()
-        if args.copy:
-            shutil.copy2(srcf, dstf)
+    destination = (
+        Path(args.dst).expanduser().resolve()
+        if args.dst
+        else source_dir.parent / f"{source_dir.name}_calm"
+    )
+    destination.mkdir(parents=True, exist_ok=True)
+    for existing in destination.glob("*.npz"):
+        if existing.is_symlink() or args.copy:
+            existing.unlink()
         else:
-            dstf.symlink_to(srcf)
+            raise SystemExit(f"refusing to replace real file without --copy: {existing}")
+    for source, _metrics, _reasons in kept:
+        target = destination / source.name
+        if args.copy:
+            shutil.copy2(source, target)
+        else:
+            target.symlink_to(source)
 
+    report_path = (
+        Path(args.report).expanduser().resolve()
+        if args.report
+        else destination / "filter_report.csv"
+    )
+    _write_report(report_path, rows)
     mode = "copied" if args.copy else "symlinked"
-    print(f"\n{mode} {n_keep} clips -> {dst}")
-    print("point the training launcher at it:")
-    print(f"  NPZ_DIR={dst}")
+    print(f"\n{mode} {len(kept)} clips -> {destination}")
+    print(f"report -> {report_path}")
 
 
 if __name__ == "__main__":

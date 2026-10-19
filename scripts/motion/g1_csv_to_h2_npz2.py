@@ -22,11 +22,11 @@ Pipeline (MuJoCo-only, same NPZ contract as the naive converter):
    frame for temporal continuity, with a posture-regularization task that softly pulls the
    *redundant* DoFs (arm yaws, head, etc.) toward the naive G1-name copy — hybrid, not naive.
 5. **Velocity + readback**: qvel is recovered by ``mj_differentiatePos`` between solved frames
-   (correct free-joint quaternion handling), then a final ``mj_forward`` pass reads the 31
+   (correct free-joint quaternion handling), then a final ``mj_forward`` pass reads the 29
    H2 hinge joints (model order) and per-body tracking sensors exactly like the naive path.
 
 Output NPZ keys are identical to the naive converter and the tracking loader:
-``fps, joint_pos(T,31), joint_vel(T,31), body_pos_w(T,nbody,3), body_quat_w(T,nbody,4),
+``fps, joint_pos(T,29), joint_vel(T,29), body_pos_w(T,nbody,3), body_quat_w(T,nbody,4),
 body_lin_vel_w(T,nbody,3), body_ang_vel_w(T,nbody,3)``.
 
 Validate a clip with ``scripts/motion/replay_npz.py`` before long training — check that feet
@@ -81,6 +81,17 @@ _FOOT_BODIES: tuple[str, ...] = ("left_ankle_roll_link", "right_ankle_roll_link"
 _ANCHOR_BODY = "pelvis"
 _TORSO_BODY = "torso_link"
 
+# Distal arm bodies (elbow, wrist) are re-targeted as a *shoulder-anchored* offset scaled by
+# the arm-length ratio instead of the leg-derived h_scale/v_scale. H2's arm/leg proportions
+# differ from G1's, so scaling the hand targets by the leg ratio distorts reach — which hurts
+# arm-dominant clips (e.g. macarena). Keyed body -> its shoulder anchor (per side).
+_ARM_SHOULDER: dict[str, str] = {
+    "left_elbow_link": "left_shoulder_roll_link",
+    "left_wrist_yaw_link": "left_shoulder_roll_link",
+    "right_elbow_link": "right_shoulder_roll_link",
+    "right_wrist_yaw_link": "right_shoulder_roll_link",
+}
+
 # Per-body IK position weights (higher = tracked harder). Feet + pelvis dominate because the
 # env's strict terminators key on foot position and pelvis height/orientation.
 _POS_WEIGHTS: dict[str, float] = {
@@ -110,22 +121,30 @@ def _body_ids(model: mujoco.MjModel, names: tuple[str, ...]) -> dict[str, int]:
     return out
 
 
-def _standing_geometry(model_file: str) -> tuple[float, float, float]:
-    """Return (pelvis_z, hip_to_foot_len, foot_z) for a model at its nominal keyframe pose.
+def _standing_geometry(model_file: str) -> tuple[float, float, float, float]:
+    """Return (pelvis_z, hip_to_foot_len, foot_z, arm_len) at the nominal keyframe pose.
 
-    Used only at startup (cold path) to derive vertical/horizontal retarget scales and the
+    Used only at startup (cold path) to derive vertical/horizontal/arm retarget scales and the
     foot-origin offset from the two robots' actual kinematics, not hard-coded magic numbers.
     ``foot_z`` is the ankle_roll body-origin height above the floor when standing (the offset
-    that keeps a grounded foot's *body origin* at its natural height after retarget).
+    that keeps a grounded foot's *body origin* at its natural height after retarget). ``arm_len``
+    is the 3D shoulder_roll->wrist_yaw distance, used to scale distal arm targets by H2's own
+    arm proportions rather than the leg ratio.
     """
     model = mujoco.MjModel.from_xml_path(model_file)
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
-    ids = _body_ids(model, ("pelvis", "left_hip_roll_link", "left_ankle_roll_link"))
+    ids = _body_ids(model, (
+        "pelvis", "left_hip_roll_link", "left_ankle_roll_link",
+        "left_shoulder_roll_link", "left_wrist_yaw_link",
+    ))
     pelvis_z = float(data.xpos[ids["pelvis"], 2])
     foot_z = float(data.xpos[ids["left_ankle_roll_link"], 2])
     hip_to_foot = float(data.xpos[ids["left_hip_roll_link"], 2] - foot_z)
-    return pelvis_z, hip_to_foot, foot_z
+    arm_len = float(np.linalg.norm(
+        data.xpos[ids["left_shoulder_roll_link"]] - data.xpos[ids["left_wrist_yaw_link"]]
+    ))
+    return pelvis_z, hip_to_foot, foot_z, arm_len
 
 
 def _quat_error_world(q_target: np.ndarray, q_current: np.ndarray) -> np.ndarray:
@@ -175,6 +194,7 @@ def _build_targets(
     h_scale: float,
     v_scale: float,
     foot_offset: float,
+    arm_scale: float,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     """Scale G1 body world poses into contact-preserving H2 targets.
 
@@ -182,7 +202,9 @@ def _build_targets(
     ``foot_offset`` (H2's nominal ankle-origin height) -> a grounded foot's body origin lands
     at its natural H2 height and the pelvis lands near H2 nominal. Horizontal: offset from the
     pelvis, scaled by leg-length ratio -> stance/stride/reach grow with the longer legs.
-    Orientation is copied unchanged (scale-free).
+    Distal arm bodies (elbow, wrist) are then overwritten with a shoulder-anchored offset
+    scaled by ``arm_scale`` (H2's arm-length ratio) so hand reach follows H2's arm proportions
+    instead of the leg ratio. Orientation is copied unchanged (scale-free).
     """
     support_z = min(g1_pos[f][2] for f in _FOOT_BODIES)  # world Z of the planted foot
     pelvis_xy = g1_pos[_ANCHOR_BODY][:2]
@@ -195,8 +217,35 @@ def _build_targets(
         xy = pelvis_xy + (p[:2] - pelvis_xy) * h_scale
         z = (p[2] - support_z) * v_scale + foot_offset
         tgt_pos[name] = np.array([xy[0], xy[1], z], dtype=np.float64)
+    # Re-target distal arm bodies as a full-3D offset from their (already-scaled) shoulder
+    # target, scaled by the arm-length ratio. The shoulder sits near the torso and keeps its
+    # leg/pelvis-scaled target; only the arm's internal reach is rescaled.
+    for name, shoulder in _ARM_SHOULDER.items():
+        tgt_pos[name] = tgt_pos[shoulder] + (g1_pos[name] - g1_pos[shoulder]) * arm_scale
     tgt_quat = {name: g1_quat[name].copy() for name in _ORI_WEIGHTS}
     return tgt_pos, tgt_quat
+
+
+def _smooth_ground_lift(raw_lift: np.ndarray, window: int) -> np.ndarray:
+    """Smooth the per-frame grounding lift into gentle ramps (no floor re-penetration).
+
+    ``raw_lift[i] >= 0`` is the rigid vertical lift frame ``i`` needs so its deepest sole sits
+    on the floor. Applying it per-frame makes a Z sawtooth whose finite-difference velocity is
+    a train of spurious root vertical-velocity spikes in the exported motion. Here we (1) dilate
+    (moving max) so an isolated spike becomes a short plateau, (2) box-average the plateau edges
+    into ramps, then (3) clamp back to ``>= raw_lift`` so a smoothed frame never dips below the
+    floor again. Lift-only (never negative), so genuine flight/hop phases are preserved.
+    """
+    n = raw_lift.size
+    if window <= 1 or n == 0 or not np.any(raw_lift > 0.0):
+        return raw_lift
+    half = window // 2
+    dil = np.empty_like(raw_lift)
+    for i in range(n):
+        dil[i] = raw_lift[max(0, i - half):min(n, i + half + 1)].max()
+    kernel = np.ones(window, dtype=np.float64) / float(window)
+    smooth = np.convolve(dil, kernel, mode="same")
+    return np.maximum(smooth, raw_lift)
 
 
 class _H2Ik:
@@ -276,6 +325,7 @@ def run_h2_ik_export(
     h_scale: float,
     v_scale: float,
     foot_offset: float,
+    arm_scale: float,
     damping: float,
     posture_w: float,
     iters: int,
@@ -283,6 +333,7 @@ def run_h2_ik_export(
     debug: bool,
     ground: bool = True,
     ground_tol: float = 0.0,
+    ground_smooth: int = 5,
 ) -> dict[str, float]:
     tmp_model_path, _, _ = inject_mujoco_tracking_sensors(h2_model_file)
     try:
@@ -313,11 +364,12 @@ def run_h2_ik_export(
     # seed pose = H2 nominal keyframe (qpos0) with naive G1-copied hinges as posture bias
     data.qpos[:] = model.qpos0
     err_accum = 0.0
+    arm_err_accum = 0.0
     for i in tqdm(range(num_frames), desc=f"{output_file.stem} ik", leave=False):
         g1_pos, g1_quat = source.poses(
             loader.motion_base_poss[i], loader.motion_base_rots[i], loader.motion_dof_poss[i]
         )
-        tgt_pos, tgt_quat = _build_targets(g1_pos, g1_quat, h_scale, v_scale, foot_offset)
+        tgt_pos, tgt_quat = _build_targets(g1_pos, g1_quat, h_scale, v_scale, foot_offset, arm_scale)
         # naive G1-name copy = posture bias for redundant DoFs (0 for H2-only head joints)
         bias = np.zeros(num_joints)
         for j, (qa, _va) in enumerate(inj):
@@ -333,6 +385,10 @@ def run_h2_ik_export(
         qpos_traj[i] = data.qpos.copy()
         if debug:
             err_accum += float(np.linalg.norm(tgt_pos["left_ankle_roll_link"] - data.xpos[ik.body_ids["left_ankle_roll_link"]]))
+            arm_err_accum += 0.5 * (
+                float(np.linalg.norm(tgt_pos["left_wrist_yaw_link"] - data.xpos[ik.body_ids["left_wrist_yaw_link"]]))
+                + float(np.linalg.norm(tgt_pos["right_wrist_yaw_link"] - data.xpos[ik.body_ids["right_wrist_yaw_link"]]))
+            )
 
     # --- grounding pass: project floor penetration out of each frame ---
     # The IK targets the ankle-*origin* height, not the sole contact point, so a pitched
@@ -341,6 +397,11 @@ def run_h2_ik_export(
     # sits on the floor. Lift-only (never drop) preserves genuine flight/hop phases.
     ground_stats = {"lifted": 0, "max_pen": 0.0}
     if ground and foot_contact_geoms:
+        # Collect the per-frame required lift first, then smooth it over time before applying,
+        # so isolated single-frame corrections become gentle ramps instead of a Z sawtooth
+        # (otherwise mj_differentiatePos turns each lift delta into a spurious root
+        # vertical-velocity spike in the exported motion).
+        raw_lift = np.zeros(num_frames, dtype=np.float64)
         for i in range(num_frames):
             data.qpos[:] = qpos_traj[i]
             mujoco.mj_forward(model, data)  # runs collision detection -> data.contact
@@ -350,12 +411,15 @@ def run_h2_ik_export(
                 if con.geom1 in foot_contact_geoms or con.geom2 in foot_contact_geoms:
                     pen = min(pen, float(con.dist))  # most-negative = deepest penetration
             if pen < -ground_tol:
-                qpos_traj[i, 2] += -pen  # rigid vertical lift so deepest sole -> z=0
-                ground_stats["lifted"] += 1
+                raw_lift[i] = -pen  # rigid vertical lift so deepest sole -> z=0
                 ground_stats["max_pen"] = min(ground_stats["max_pen"], pen)
+        lift = _smooth_ground_lift(raw_lift, ground_smooth)
+        qpos_traj[:, 2] += lift
+        ground_stats["lifted"] = int(np.count_nonzero(lift > 1e-9))
         if debug:
             print(f"   grounding: lifted {ground_stats['lifted']}/{num_frames} frames, "
-                  f"max penetration fixed = {-ground_stats['max_pen']*100:.1f} cm")
+                  f"max penetration fixed = {-ground_stats['max_pen']*100:.1f} cm, "
+                  f"smooth window = {ground_smooth}")
 
     # --- pass 2: qvel via mj_differentiatePos, then FK readback of joints + tracking sensors ---
     dt = 1.0 / float(loader.output_fps)
@@ -405,7 +469,10 @@ def run_h2_ik_export(
         body_lin_vel_w=body_lin_vel_w,
         body_ang_vel_w=body_ang_vel_w,
     )
-    return {"mean_foot_err": err_accum / max(num_frames, 1) if debug else float("nan")}
+    return {
+        "mean_foot_err": err_accum / max(num_frames, 1) if debug else float("nan"),
+        "mean_arm_err": arm_err_accum / max(num_frames, 1) if debug else float("nan"),
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -420,12 +487,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--euler_order", type=str, default="xyz")
     p.add_argument("--h_scale", type=float, default=0.0, help="horizontal scale (0=auto: leg-length ratio)")
     p.add_argument("--v_scale", type=float, default=0.0, help="vertical scale (0=auto: pelvis-height ratio)")
+    p.add_argument("--arm_scale", type=float, default=0.0, help="distal-arm reach scale (0=auto: arm-length ratio)")
     p.add_argument("--ik_iters", type=int, default=12, help="DLS iterations per frame")
     p.add_argument("--warm_iters", type=int, default=60, help="DLS iterations for the first frame")
     p.add_argument("--damping", type=float, default=0.1, help="DLS damping (lambda)")
     p.add_argument("--posture_w", type=float, default=0.15, help="posture-regularization weight")
     p.add_argument("--no_ground", action="store_true", help="disable the floor-penetration grounding pass")
     p.add_argument("--ground_tol", type=float, default=0.0, help="allowed foot penetration (m) before lifting")
+    p.add_argument("--ground_smooth", type=int, default=5,
+                   help="temporal window (frames) to smooth the grounding lift (1=off, per-frame)")
     p.add_argument("--limit", type=int, default=0, help="convert only the first N clips (0=all)")
     p.add_argument(
         "--skip_existing", action="store_true",
@@ -444,16 +514,18 @@ def main() -> None:
     output_files = resolve_outputs(args.input, args.output, csv_files)
 
     # Derive retarget scales from the two robots' actual standing kinematics (cold path).
-    g1_pelvis, g1_leg, _g1_foot = _standing_geometry(args.g1_model_xml)
-    h2_pelvis, h2_leg, h2_foot = _standing_geometry(args.h2_model_xml)
+    g1_pelvis, g1_leg, _g1_foot, g1_arm = _standing_geometry(args.g1_model_xml)
+    h2_pelvis, h2_leg, h2_foot, h2_arm = _standing_geometry(args.h2_model_xml)
     h_scale = args.h_scale or (h2_leg / g1_leg)
     v_scale = args.v_scale or (h2_pelvis / g1_pelvis)
+    arm_scale = args.arm_scale or (h2_arm / g1_arm)
     foot_offset = h2_foot  # H2 nominal ankle-origin height -> grounded feet land naturally
 
     print(f"[g1_csv_to_h2_npz2] {len(csv_files)} clip(s); G1={args.g1_model_xml}  H2={args.h2_model_xml}")
     print(f"[g1_csv_to_h2_npz2] input_fps={args.input_fps:g} output_fps={args.output_fps:g}")
     print(f"[g1_csv_to_h2_npz2] scales: h_scale={h_scale:.4f} (leg {g1_leg:.3f}->{h2_leg:.3f}) "
-          f"v_scale={v_scale:.4f} (pelvis {g1_pelvis:.3f}->{h2_pelvis:.3f})")
+          f"v_scale={v_scale:.4f} (pelvis {g1_pelvis:.3f}->{h2_pelvis:.3f}) "
+          f"arm_scale={arm_scale:.4f} (arm {g1_arm:.3f}->{h2_arm:.3f})")
     print(f"[g1_csv_to_h2_npz2] ik: iters={args.ik_iters} warm={args.warm_iters} "
           f"damping={args.damping} posture_w={args.posture_w}")
     if args.dry_run:
@@ -477,12 +549,15 @@ def main() -> None:
             source = _SourceFK(args.g1_model_xml, list(loader.joint_names))
             stats = run_h2_ik_export(
                 loader, source, args.h2_model_xml, output_file,
-                h_scale=h_scale, v_scale=v_scale, foot_offset=foot_offset, damping=args.damping,
-                posture_w=args.posture_w, iters=args.ik_iters, warm_iters=args.warm_iters,
-                debug=args.debug, ground=not args.no_ground, ground_tol=args.ground_tol,
+                h_scale=h_scale, v_scale=v_scale, foot_offset=foot_offset, arm_scale=arm_scale,
+                damping=args.damping, posture_w=args.posture_w, iters=args.ik_iters,
+                warm_iters=args.warm_iters, debug=args.debug, ground=not args.no_ground,
+                ground_tol=args.ground_tol, ground_smooth=args.ground_smooth,
             )
             if args.debug:
-                print(f"[g1_csv_to_h2_npz2] {output_file.name}: mean_foot_err={stats['mean_foot_err']:.4f} m")
+                print(f"[g1_csv_to_h2_npz2] {output_file.name}: "
+                      f"mean_foot_err={stats['mean_foot_err']:.4f} m  "
+                      f"mean_arm_err={stats['mean_arm_err']:.4f} m")
         except Exception as exc:  # keep going on a bad clip
             failures.append((csv_file, str(exc)))
             print(f"[g1_csv_to_h2_npz2] FAILED {csv_file.name}: {exc}")

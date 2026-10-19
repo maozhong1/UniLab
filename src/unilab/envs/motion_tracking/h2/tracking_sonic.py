@@ -1,22 +1,23 @@
 """H2 SONIC motion-tracking env (task ``H2SonicMotionTracking``) — full-train layout.
 
-A Unitree H2 (31-DOF) clone of the G1 sonic tracking env (``g1/tracking_sonic.py``).
-H2 = G1's 29 joints + ``head_pitch``/``head_yaw``; all other joint and body names are
-identical, so anchor (``pelvis``), the 14 tracked ``body_names``, and the sonic obs
-layout carry over unchanged — everything is derived from ``n = self._num_action`` (31):
+A Unitree H2 (29-DOF) clone of the G1 sonic tracking env (``g1/tracking_sonic.py``).
+H2's head is welded (no head joints/actuators) so its joint set is identical to the
+Unitree G1 29-DOF; all joint and body names match, so anchor (``pelvis``), the 14
+tracked ``body_names``, and the sonic obs layout carry over unchanged — everything is
+derived from ``n = self._num_action`` (29):
 
-    encoder-input (680 = (2*31 + 6) * 10):  multi-future command (jpos+jvel, sonic's
+    encoder-input (640 = (2*29 + 6) * 10):  multi-future command (jpos+jvel, sonic's
         legacy [all q, all dq]->reshape(F,2n) packing) ++ anchor 6D, F=10.
-    proprio       (990 = (3 + 31 + 31 + 31 + 3) * 10):  pelvis gyro ++ joint_pos_rel ++
+    proprio       (930 = (3 + 29 + 29 + 29 + 3) * 10):  pelvis gyro ++ joint_pos_rel ++
         dof_vel ++ last_actions ++ gravity_dir, per-term history oldest-first, H=10.
-    actor total   (1670 = 680 + 990).  ``SonicH2ActorModel`` splits it internally.
+    actor total   (1570 = 640 + 930).  ``SonicH2ActorModel`` splits it internally.
 
 From-scratch training only (no G1 ``last.pt`` in H2 joint layout): NO MuJoCo<->IsaacLab
 permutation (both perms stay False; everything is one self-consistent MuJoCo joint
-order). Critic uses the privileged_mf_hist path (1745 for n=31, nb=14), trained fresh.
+order). Critic uses the privileged_mf_hist path (1645 for n=29, nb=14), trained fresh.
 
 Action scale = 0.25 * effort / Kp in MJCF actuator order, from gear_sonic h2.py
-(reuses G1 PD/armature constants; effort ≈ 3x G1, plus a head group).
+(reuses G1 PD/armature constants; effort ≈ 3x G1).
 """
 from __future__ import annotations
 
@@ -42,7 +43,7 @@ _ANCHOR_ORI6 = 6
 _GRAVITY = np.array([0.0, 0.0, -1.0], dtype=np.float32)
 
 # H2 SONIC residual-action scale = 0.25 * effort_limit / Kp, in H2 MJCF actuator order
-# (L-leg, R-leg, waist, head, L-arm, R-arm). Kp/effort from gear_sonic h2.py; must match
+# (L-leg, R-leg, waist, L-arm, R-arm). Kp/effort from gear_sonic h2.py; must match
 # the <position kp forcerange> actuators authored in robots/h2/h2.xml.
 _SONIC_ACTION_SCALE_MUJOCO = np.array(
     [
@@ -54,8 +55,6 @@ _SONIC_ACTION_SCALE_MUJOCO = np.array(
         0.25 * 417.0 / 99.0984, 0.25 * 150.0 / 28.5012, 0.25 * 150.0 / 28.5012,
         # waist: yaw, roll, pitch
         0.25 * 264.0 / 40.1792, 0.25 * 150.0 / 28.5012, 0.25 * 150.0 / 28.5012,
-        # head: pitch, yaw
-        0.25 * 150.0 / 28.5012, 0.25 * 150.0 / 28.5012,
         # left arm: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw
         0.25 * 75.0 / 14.2506, 0.25 * 75.0 / 14.2506, 0.25 * 75.0 / 14.2506,
         0.25 * 75.0 / 14.2506, 0.25 * 75.0 / 14.2506, 0.25 * 15.0 / 16.7783, 0.25 * 15.0 / 16.7783,
@@ -119,9 +118,19 @@ class SonicRewardConfig(RewardConfig):
             "joint_acc_l2": -2.5e-7,
             "joint_torque_l2": -1.0e-6,
             "anti_shake_ang_vel": -5.0e-3,
+            # ── Curriculum terms (enabled from stage 2.5 by full_train_h2.sh) ──
+            #   target_rate_l2       : squared change in the physical PD position target
+            #                          (action_scale·Δaction); replaces action_rate_l2
+            #                          once the policy is stable, smoother in torque space.
+            #   upper_body_joint_pos : joint-space tracking of the 14 shoulder/elbow/wrist
+            #                          joints, to sharpen arm/hand motion (dances, upright
+            #                          manipulation). Neither term changes obs/action/ckpt.
+            "target_rate_l2": 0.0,
+            "upper_body_joint_pos": 0.0,
         }
     )
     std_local_points: float = 0.1
+    std_upper_body_joint_pos: float = 0.2
     # Robot foot world-z below this (flat ground) counts as "in contact" for the
     # feet_slide / feet_yaw gates. Calibrate to H2 ankle_roll_link stance height.
     feet_contact_height: float = 0.15
@@ -136,7 +145,7 @@ class H2SonicMotionTrackingCfg(MotionTrackingCfg):
     """SONIC H2 tracking: pelvis anchor, multi-future command, proprio history.
 
     From-scratch full training: encoder + decoder both trainable, no warm-start, no
-    joint permutation (single MuJoCo joint order). Critic = privileged_mf_hist (1745).
+    joint permutation (single MuJoCo joint order). Critic = privileged_mf_hist (1645).
     """
 
     scene: SceneCfg = field(
@@ -171,7 +180,7 @@ class H2SonicMotionTrackingCfg(MotionTrackingCfg):
     )
     sensor: Sensor = field(default_factory=lambda: Sensor(gyro="pelvis_gyro"))
     critic_include_future: bool = True
-    # Enabled via +env.critic_privileged_mf_hist=true in full_train_h2.sh (1745-d critic).
+    # Enabled via +env.critic_privileged_mf_hist=true in full_train_h2.sh (1645-d critic).
     critic_privileged_mf_hist: bool = False
 
 
@@ -200,6 +209,19 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
         )
         self._strict_done = np.empty((num_envs,), dtype=bool)
         self._strict_ee_mask = np.empty((num_envs, self.ee_body_indices.size), dtype=bool)
+        # Per-reason termination masks for the 4 strict gates, logged as termination/strict_*
+        # by the base MotionTrackingEnv (see common/tracking.py _ensure_termination_reason_masks).
+        self._termination_reason_masks.update(
+            {
+                name: np.zeros((num_envs,), dtype=bool)
+                for name in (
+                    "strict_anchor_height",
+                    "strict_end_effector_height",
+                    "strict_anchor_orientation",
+                    "strict_foot_position",
+                )
+            }
+        )
 
         # feet_slide / feet_yaw penalty scratch (zero-alloc hot path). Contact is
         # proxied by robot foot world-z < feet_contact_height (see SonicRewardConfig).
@@ -220,10 +242,10 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
         self._jperm = np.arange(n, dtype=np.intp)
         self._action_out_perm = None
 
-        self._enc_dim = (_CMD_PER_FRAME * n + _ANCHOR_ORI6) * self._F   # 680 (n=31,F=10)
-        self._proprio_frame_dim = 3 + n + n + n + 3                     # 99
-        self._proprio_dim = self._proprio_frame_dim * self._H          # 990
-        self._sonic_actor_dim = self._enc_dim + self._proprio_dim      # 1670
+        self._enc_dim = (_CMD_PER_FRAME * n + _ANCHOR_ORI6) * self._F   # 640 (n=29,F=10)
+        self._proprio_frame_dim = 3 + n + n + n + 3                     # 93
+        self._proprio_dim = self._proprio_frame_dim * self._H          # 930
+        self._sonic_actor_dim = self._enc_dim + self._proprio_dim      # 1570
 
         dtype = get_global_dtype()
         H = self._H
@@ -259,6 +281,18 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
         self._ankle_dof_indices = np.asarray(
             [i for i, nm in enumerate(act_names) if "ankle" in nm], dtype=np.intp
         )
+        # The 14 upper-body (shoulder/elbow/wrist) actuators tracked by upper_body_joint_pos.
+        self._upper_body_dof_indices = np.asarray(
+            [
+                i
+                for i, name in enumerate(act_names)
+                if any(part in name for part in ("shoulder", "elbow", "wrist"))
+            ],
+            dtype=np.intp,
+        )
+        # Head is welded in the 29-DOF model (no head actuator), so this is empty and the
+        # head branch of anti_shake_ang_vel is inert. Kept defensively: if a future XML
+        # re-adds an actuated head it is regularised again with no further code change.
         self._head_dof_indices = np.asarray(
             [i for i, nm in enumerate(act_names) if "head" in nm], dtype=np.intp
         )
@@ -266,9 +300,19 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
             kp, kd = self._backend.get_actuator_gains()
             self._torque_kp = np.asarray(kp, dtype=dtype)
             self._torque_kd = np.asarray(kd, dtype=dtype)
+            # Per-joint torque limit implied by the action-scale contract (s = 0.25·τ/kp),
+            # so |estimated PD torque| >= limit flags saturation for the diagnostics log.
+            self._torque_limit = (
+                np.abs(np.asarray(cfg.control_config.action_scale, dtype=dtype))
+                * self._torque_kp
+                / 0.25
+            )
         except Exception:  # backend without PD gains → joint_torque_l2 returns 0
             self._torque_kp = None
             self._torque_kd = None
+            self._torque_limit = None
+        self._estimated_torque = np.empty((num_envs, n), dtype=dtype)
+        self._torque_saturated = np.empty((num_envs, n), dtype=bool)
         # Wrists ARE tracked bodies (14-body set); head is not, so anti_shake handles
         # the head in joint-velocity space instead (see _reward_anti_shake_ang_vel).
         self._wrist_body_indices = np.asarray(
@@ -414,7 +458,7 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
         self, info, motion_data, linvel, gyro, dof_pos, dof_vel,
         robot_body_pos_w, robot_body_quat_w,
     ) -> np.ndarray:
-        """Byte-exact official privileged_mf_hist value observation (1745 for n=31)."""
+        """Byte-exact official privileged_mf_hist value observation (1645 for n=29)."""
         dtype = get_global_dtype()
         R = dof_pos.shape[0]
         ai = self.anchor_body_idx
@@ -476,6 +520,30 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
         self._reward_fns["joint_acc_l2"] = self._reward_joint_acc_l2
         self._reward_fns["joint_torque_l2"] = self._reward_joint_torque_l2
         self._reward_fns["anti_shake_ang_vel"] = self._reward_anti_shake_ang_vel
+        self._reward_fns["target_rate_l2"] = self._reward_target_rate_l2
+        self._reward_fns["upper_body_joint_pos"] = self._reward_upper_body_joint_pos
+
+    def _reward_target_rate_l2(self, ctx: Any) -> np.ndarray:
+        """Squared change in physical PD position targets, in radian units."""
+        np.subtract(ctx.info["current_actions"], ctx.info["last_actions"], out=ctx.joint_error)
+        ctx.joint_error *= self._cfg.control_config.action_scale
+        np.square(ctx.joint_error, out=ctx.joint_error)
+        np.sum(ctx.joint_error, axis=1, out=ctx.env_error)
+        return ctx.env_error
+
+    def _reward_upper_body_joint_pos(self, ctx: Any) -> np.ndarray:
+        """Track the 14 shoulder, elbow, and wrist joints without changing observations."""
+        idx = self._upper_body_dof_indices
+        error = ctx.motion_data.joint_pos[:, idx] - ctx.dof_pos[:, idx]
+        np.square(error, out=error)
+        np.mean(error, axis=1, out=ctx.env_error)
+        np.divide(
+            ctx.env_error,
+            -(self._cfg.reward_config.std_upper_body_joint_pos**2),
+            out=ctx.reward_term,
+        )
+        np.exp(ctx.reward_term, out=ctx.reward_term)
+        return ctx.reward_term
 
     def _reward_joint_acc_l2(self, ctx: Any) -> np.ndarray:
         """Official ``feet_acc``: L2 of finite-difference ankle joint acceleration.
@@ -597,6 +665,52 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
         np.exp(ctx.reward_term, out=ctx.reward_term)
         return ctx.reward_term
 
+    def _compute_reward(
+        self,
+        info,
+        motion_data,
+        robot_body_pos_w,
+        robot_body_quat_w,
+        robot_body_lin_vel_w,
+        robot_body_ang_vel_w,
+        dof_pos,
+        dof_vel,
+    ):
+        reward = super()._compute_reward(
+            info,
+            motion_data,
+            robot_body_pos_w,
+            robot_body_quat_w,
+            robot_body_lin_vel_w,
+            robot_body_ang_vel_w,
+            dof_pos,
+            dof_vel,
+        )
+        # Estimated PD-torque saturation diagnostics (H2 effort ≈ 3× G1, so headroom is
+        # tight). Compares |kp·(target_q − q) − kd·q̇| with the action-scale-implied limit;
+        # logged under diagnostic/* as an estimate, not measured actuator telemetry.
+        if self._torque_limit is not None:
+            actions = info.get("current_actions")
+            if isinstance(actions, np.ndarray):
+                target_q = actions * self._cfg.control_config.action_scale
+                target_q += self._effective_default_angles()
+                np.subtract(target_q, dof_pos, out=self._estimated_torque)
+                self._estimated_torque *= self._torque_kp
+                self._estimated_torque -= self._torque_kd * dof_vel
+                np.greater_equal(
+                    np.abs(self._estimated_torque),
+                    self._torque_limit,
+                    out=self._torque_saturated,
+                )
+                log = info.setdefault("log", {})
+                log["diagnostic/estimated_torque_saturation_ratio"] = float(
+                    np.mean(self._torque_saturated)
+                )
+                log["diagnostic/estimated_upper_body_torque_saturation_ratio"] = float(
+                    np.mean(self._torque_saturated[:, self._upper_body_dof_indices])
+                )
+        return reward
+
     def _compute_terminations(self, motion_data, robot_body_pos_w, robot_body_quat_w):
         terminated = super()._compute_terminations(motion_data, robot_body_pos_w, robot_body_quat_w)
         ref_anchor_pos = motion_data.body_pos_w[:, self.anchor_body_idx]
@@ -607,6 +721,7 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
         low_reference = ref_anchor_pos[:, 2] < self._cfg.low_reference_height
         np.greater(self._env_error, self._cfg.low_reference_height_threshold, out=self._strict_done)
         self._env_bool[low_reference] = self._strict_done[low_reference]
+        self._termination_reason_masks["strict_anchor_height"][:] = self._env_bool
         terminated |= self._env_bool
 
         if self._has_ee_body_indices:
@@ -619,6 +734,7 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
             np.greater(self._ee_pos_error_z, self._cfg.low_reference_height_threshold, out=self._strict_ee_mask)
             self._ee_terminated[low_reference] = self._strict_ee_mask[low_reference]
             np.logical_or.reduce(self._ee_terminated, axis=1, out=self._env_bool)
+            self._termination_reason_masks["strict_end_effector_height"][:] = self._env_bool
             terminated |= self._env_bool
 
         ref_quat = motion_data.body_quat_w[:, self.anchor_body_idx]
@@ -630,6 +746,7 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
         self._env_error *= 2.0
         np.square(self._env_error, out=self._env_error)
         np.greater(self._env_error, self._cfg.strict_anchor_ori_error_sq, out=self._env_bool)
+        self._termination_reason_masks["strict_anchor_orientation"][:] = self._env_bool
         terminated |= self._env_bool
 
         np.subtract(
@@ -642,6 +759,7 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
         np.sqrt(self._ee_pos_error_z[:, : self._strict_foot_indices.size], out=self._ee_pos_error_z[:, : self._strict_foot_indices.size])
         np.greater(self._ee_pos_error_z[:, : self._strict_foot_indices.size], self._cfg.strict_foot_pos_threshold, out=self._ee_terminated[:, : self._strict_foot_indices.size])
         np.logical_or.reduce(self._ee_terminated[:, : self._strict_foot_indices.size], axis=1, out=self._env_bool)
+        self._termination_reason_masks["strict_foot_position"][:] = self._env_bool
         terminated |= self._env_bool
         return terminated
 

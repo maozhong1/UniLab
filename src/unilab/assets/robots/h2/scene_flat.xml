@@ -22,14 +22,14 @@
   </worldbody>
 
   <!-- Default standing pose from gear_sonic h2.py init_state (pelvis 1.04 m).
-       qpos = root(pos 3 + quat 4) ++ 31 joint angles in MJCF actuator/tree order:
+       29-DOF layout (head welded, matches Unitree G1):
+       qpos = root(pos 3 + quat 4) ++ 29 joint angles in MJCF actuator/tree order:
          L leg: hip_pitch, hip_roll, hip_yaw, knee, ankle_roll, ankle_pitch
          R leg: (same)
          waist: yaw, roll, pitch
-         head:  pitch, yaw
          L arm: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw
          R arm: (same)
-       ctrl (31) = the same joint angles (position servos hold the stand pose). -->
+       ctrl (29) = the same joint angles (position servos hold the stand pose). -->
   <keyframe>
     <key name="stand"
       qpos="
@@ -38,7 +38,6 @@
       -0.312 0.0 0.0 0.669 0.0 -0.363
       -0.312 0.0 0.0 0.669 0.0 -0.363
       0.0 0.0 0.0
-      0.0 0.0
       0.2  0.2 0.0 0.6 0.0 0.0 0.0
       0.2 -0.2 0.0 0.6 0.0 0.0 0.0
       "
@@ -46,7 +45,6 @@
       -0.312 0.0 0.0 0.669 0.0 -0.363
       -0.312 0.0 0.0 0.669 0.0 -0.363
       0.0 0.0 0.0
-      0.0 0.0
       0.2  0.2 0.0 0.6 0.0 0.0 0.0
       0.2 -0.2 0.0 0.6 0.0 0.0 0.0
       "/>
