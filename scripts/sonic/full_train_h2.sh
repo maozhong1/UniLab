@@ -40,17 +40,14 @@ elif [[ "$CURRICULUM_STAGE" == "2.5" ]]; then
   DEFAULT_TARGET_RATE_L2_SCALE=-0.05
   DEFAULT_UPPER_BODY_JOINT_POS_SCALE=0.5
   DEFAULT_ANTI_SHAKE_ANG_VEL_SCALE=-2.5e-3
-  # NOTE: macarena clips have body_ang_p99 >= 8.25, so the Stage 2.5 calm filter (8.0)
-  # drops them all and this focus is a no-op (warns, no oversampling). It only takes
-  # effect once a stage admits macarena (>=10.0: Stage 2.8/3/full). Kept per request so
-  # that relaxing the Stage 2.5 filter immediately engages oversampling.
+  # The Stage 2.5 body-angular limit (9.0) admits some, but not necessarily all,
+  # macarena clips; focus oversampling is skipped with a warning if none pass all filters.
   DEFAULT_FOCUS_PATTERN='*macarena*.npz'
   DEFAULT_FOCUS_REPEAT=5
 else
   # Stages 1, 2, 3, full. Oversample macarena by default (the 3k base set has only a small
-  # fraction). macarena has body_ang_p99 >= 8.25, so it only survives the Stage 3/full
-  # filter (>=12) and partly Stage 2.8 (>=10); at Stages 1/2 the focus is a no-op (warns,
-  # no oversampling). Stage 1 overrides this to no focus (see below) to keep its log clean.
+  # fraction). Stage 1/2 filters reject its clips; Stage 2.5 may admit some at body_ang_p99
+  # <= 9, with later stages admitting more. Stage 1 overrides this to no focus (see below).
   DEFAULT_LEARNING_RATE=2e-5
   DEFAULT_ADAPTIVE_LR_MAX=2e-4
   DEFAULT_ENTROPY_COEF=0.004
@@ -80,6 +77,9 @@ ANTI_SHAKE_ANG_VEL_SCALE="${ANTI_SHAKE_ANG_VEL_SCALE:-$DEFAULT_ANTI_SHAKE_ANG_VE
 FOCUS_PATTERN="${FOCUS_PATTERN:-$DEFAULT_FOCUS_PATTERN}"
 FOCUS_REPEAT="${FOCUS_REPEAT:-$DEFAULT_FOCUS_REPEAT}"
 INIT_STD="${INIT_STD:-0.50}"
+# Resume-only: freeze the actor for N iterations so the critic re-fits first (e.g. after the
+# motion data changes under a warm policy). 0 = off.
+CRITIC_WARMUP="${CRITIC_WARMUP:-0}"
 
 if [[ "$CURRICULUM_STAGE" == "3" ]]; then
   DEFAULT_STRICT_FOOT_POS_THRESHOLD=0.45
@@ -111,11 +111,18 @@ if [[ -z "${NPZ_DIR:-}" ]]; then
         --base-z-range 0.15 --foot-height-max 0.35
       )
       ;;
-    2|2.5)
+    2)
       FILTER_ARGS=(
         --body-ang-p99 8.0 --joint-vel-p99 7.0
         --base-lin-p99 1.8 --base-ang-p99 2.5
         --base-z-range 0.25 --foot-height-max 0.45
+      )
+      ;;
+    2.5)
+      FILTER_ARGS=(
+        --body-ang-p99 9.0 --joint-vel-p99 7.5
+        --base-lin-p99 2.0 --base-ang-p99 3.0
+        --base-z-range 0.30 --foot-height-max 0.50
       )
       ;;
     2.8)
@@ -251,11 +258,14 @@ MOTION_OVERRIDE_FILE="$WORK_DIR/motion_override/$MOTION_OVERRIDE_NAME.yaml"
 echo "wrote ${#NPZ_FILES[@]} motion clips -> $MOTION_OVERRIDE_FILE"
 
 RESUME_ARGS=(algo.resume=false)
-if [[ "$CURRICULUM_STAGE" != "1" ]]; then
-  if [[ -z "${LOAD_RUN:-}" ]]; then
-    echo "ERROR: LOAD_RUN is required for curriculum stage $CURRICULUM_STAGE" >&2
-    exit 2
-  fi
+# Stages > 1 always resume a prior run (LOAD_RUN required). Stage 1 is from
+# scratch unless LOAD_RUN is set, in which case it resumes (e.g. restart after
+# a disk-full interruption).
+if [[ "$CURRICULUM_STAGE" != "1" && -z "${LOAD_RUN:-}" ]]; then
+  echo "ERROR: LOAD_RUN is required for curriculum stage $CURRICULUM_STAGE" >&2
+  exit 2
+fi
+if [[ -n "${LOAD_RUN:-}" ]]; then
   RUN_DIR="$UNILAB/logs/rsl_rl_ppo/H2SonicMotionTracking/$LOAD_RUN"
   if [[ ! -d "$RUN_DIR" ]]; then
     echo "ERROR: H2 run directory does not exist: $RUN_DIR" >&2
@@ -278,9 +288,6 @@ if [[ "$CURRICULUM_STAGE" != "1" ]]; then
   fi
   RESUME_ARGS=(algo.resume=true "algo.load_run=$LOAD_RUN" "algo.checkpoint=$CKPT")
   echo "resuming $LOAD_RUN @ checkpoint $CKPT"
-elif [[ -n "${LOAD_RUN:-}" ]]; then
-  echo "ERROR: Stage 1 is from scratch; unset LOAD_RUN" >&2
-  exit 2
 fi
 
 TRAIN_ARGS=(
@@ -292,6 +299,7 @@ TRAIN_ARGS=(
   "algo.algorithm.learning_rate=$LEARNING_RATE"
   "algo.algorithm.entropy_coef=$ENTROPY_COEF"
   algo.algorithm.desired_kl=0.01
+  "algo.algorithm.critic_warmup_iters=$CRITIC_WARMUP"
   "algo.algorithm.adaptive_lr_max=$ADAPTIVE_LR_MAX"
   "algo.num_steps_per_env=$NUM_STEPS"
   "reward.scales.motion_global_root_pos=$ROOT_POS_SCALE"

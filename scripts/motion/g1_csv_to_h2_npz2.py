@@ -1,12 +1,11 @@
-"""Convert G1 29-DoF CSV motions to H2 31-DoF tracking NPZ via task-space IK retarget.
+"""Convert G1 29-DoF CSV motions to H2 29-DoF tracking NPZ via task-space IK retarget.
 
-This is the *proper retarget* successor to the naive ``g1_csv_to_h2_npz.py``. The naive
-converter injects G1 joint angles into H2 by name and rescales only root-Z; because H2's
+Copying G1 joint angles into H2 by name (and rescaling only root-Z) does not work: H2's
 legs are ~1.43x longer than G1's (and the shank grows more than the thigh — H2 shank/thigh
-= 1.13 vs G1 0.94), copied joint angles put H2 feet off the ground and drift the CoM. Here
+= 1.13 vs G1 0.94), so copied joint angles put H2 feet off the ground and drift the CoM. Here
 we instead solve H2 joint angles so H2's *bodies* land where a size-scaled G1 pose puts them.
 
-Pipeline (MuJoCo-only, same NPZ contract as the naive converter):
+Pipeline (MuJoCo-only, same NPZ contract as the G1 ``bones_seed_csv_to_npz.py``):
 
 1. ``MotionLoader`` parses the G1 CSV (29 ``*_joint_dof`` cols + root), resamples 120->50 fps
    and computes root/joint velocities (reused verbatim from the G1 converter).
@@ -21,11 +20,14 @@ Pipeline (MuJoCo-only, same NPZ contract as the naive converter):
    dependency) drives H2 qpos to hit those targets each frame, warm-started from the previous
    frame for temporal continuity, with a posture-regularization task that softly pulls the
    *redundant* DoFs (arm yaws, head, etc.) toward the naive G1-name copy — hybrid, not naive.
+   Foot orientation is matched on H2's *distal* foot ``ankle_pitch_link``: H2's ankle chain
+   is roll->pitch, the reverse of G1's pitch->roll, so H2 ``ankle_roll_link`` is only an
+   intermediate link (``--legacy_foot_ori`` restores the old, incorrect roll-link target).
 5. **Velocity + readback**: qvel is recovered by ``mj_differentiatePos`` between solved frames
    (correct free-joint quaternion handling), then a final ``mj_forward`` pass reads the 29
-   H2 hinge joints (model order) and per-body tracking sensors exactly like the naive path.
+   H2 hinge joints (model order) and per-body ``track_*`` tracking sensors.
 
-Output NPZ keys are identical to the naive converter and the tracking loader:
+Output NPZ keys match the tracking loader:
 ``fps, joint_pos(T,29), joint_vel(T,29), body_pos_w(T,nbody,3), body_quat_w(T,nbody,4),
 body_lin_vel_w(T,nbody,3), body_ang_vel_w(T,nbody,3)``.
 
@@ -36,33 +38,33 @@ Usage:
     uv run scripts/motion/g1_csv_to_h2_npz2.py --input <csv_or_dir> --output <dir>
     uv run scripts/motion/g1_csv_to_h2_npz2.py --input clip.csv --output out.npz --debug
     uv run scripts/motion/g1_csv_to_h2_npz2.py --input <dir> --output <dir> --limit 20
+    uv run scripts/motion/g1_csv_to_h2_npz2.py --input <dir> --output <dir> --workers 10
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-import mujoco
-import numpy as np
-from tqdm import tqdm
+# One BLAS thread per process: the IK solves are tiny (35x35) and --workers parallelizes
+# across clips, so multi-threaded BLAS would only oversubscribe the cores.
+for _thread_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_thread_var, "1")
 
-from unilab.assets import ASSETS_ROOT_PATH
-from unilab.base.backend.mujoco.xml import inject_mujoco_tracking_sensors
+import mujoco  # noqa: E402
+import numpy as np  # noqa: E402
+from tqdm import tqdm  # noqa: E402
 
-# Reuse the validated CSV parser and the shared readback/sensor helpers from the naive
-# converter (same dir) instead of re-implementing them here.
+from unilab.assets import ASSETS_ROOT_PATH  # noqa: E402
+from unilab.base.backend.mujoco.xml import inject_mujoco_tracking_sensors  # noqa: E402
+from unilab.tools.bones_seed_csv import resolve_input_files  # noqa: E402
+
+# Reuse the validated CSV parser / interpolator from the G1 converter (same dir).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from g1_csv_to_h2_npz import (  # noqa: E402, I001
-    MotionLoader,
-    _hinge_joint_readback,
-    _map_csv_joints,
-    _sensor_addr_table,
-    _SENSOR_DIMS,
-    resolve_input_files,
-    resolve_outputs,
-)
+from bones_seed_csv_to_npz import MotionLoader  # noqa: E402
 
 DEFAULT_G1_MODEL = str(ASSETS_ROOT_PATH / "robots" / "g1" / "scene_flat.xml")
 DEFAULT_H2_MODEL = str(ASSETS_ROOT_PATH / "robots" / "h2" / "scene_flat.xml")
@@ -109,6 +111,68 @@ _ORI_WEIGHTS: dict[str, float] = {
     "pelvis": 5.0, "torso_link": 3.0,
     "left_ankle_roll_link": 4.0, "right_ankle_roll_link": 4.0,
 }
+# H2 body that receives each G1 orientation target (keyed by the G1 body in _ORI_WEIGHTS).
+# G1's distal foot is ankle_roll_link (pitch joint proximal, roll distal); H2 reverses the
+# chain, so its distal foot — the one carrying the sole contact geom — is ankle_pitch_link.
+# Matching the G1 foot orientation on H2's intermediate ankle_roll_link (legacy behaviour)
+# forces the shank upright, removes stance knee bend, and tilts the sole by the copied
+# ankle pitch.
+_ORI_H2_BODY: dict[str, str] = {
+    "pelvis": "pelvis", "torso_link": "torso_link",
+    "left_ankle_roll_link": "left_ankle_pitch_link",
+    "right_ankle_roll_link": "right_ankle_pitch_link",
+}
+_ORI_H2_BODY_LEGACY: dict[str, str] = {name: name for name in _ORI_WEIGHTS}
+
+
+_SENSOR_PREFIXES = ("track_pos_w_", "track_quat_w_", "track_linvel_w_", "track_angvel_w_")
+_SENSOR_DIMS = (3, 4, 3, 3)
+
+
+def _hinge_joint_readback(model: mujoco.MjModel) -> list[tuple[int, int]]:
+    """(qpos_adr, dof_adr) for every non-free joint, in model (tree/actuator) order."""
+    out: list[tuple[int, int]] = []
+    for jid in range(model.njnt):
+        if model.jnt_type[jid] == mujoco.mjtJoint.mjJNT_FREE:
+            continue
+        out.append((int(model.jnt_qposadr[jid]), int(model.jnt_dofadr[jid])))
+    return out
+
+
+def _map_csv_joints(model: mujoco.MjModel, joint_names: list[str]) -> list[tuple[int, int]]:
+    """(qpos_adr, dof_adr) for each CSV joint, resolved by name in the model."""
+    inj: list[tuple[int, int]] = []
+    for name in joint_names:
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        if jid < 0:
+            raise ValueError(f"CSV joint '{name}' not found in model")
+        inj.append((int(model.jnt_qposadr[jid]), int(model.jnt_dofadr[jid])))
+    return inj
+
+
+def _sensor_addr_table(model: mujoco.MjModel) -> np.ndarray:
+    """Per-body sensordata addresses of the injected ``track_*`` sensors (-1 = absent)."""
+    adrs = np.full((model.nbody, 4), -1, dtype=np.int32)
+    for body_id in range(model.nbody):
+        body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+        if not body_name:
+            continue
+        for k, prefix in enumerate(_SENSOR_PREFIXES):
+            sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, f"{prefix}{body_name}")
+            if sid >= 0:
+                adrs[body_id, k] = model.sensor_adr[sid]
+    return adrs
+
+
+def resolve_outputs(input_path: str, output: str, csv_files: list[Path]) -> list[Path]:
+    in_root = Path(input_path).expanduser().resolve()
+    if in_root.is_file():
+        out = Path(output).expanduser().resolve()
+        if out.suffix.lower() == ".npz":
+            return [out]
+        return [out / f"{in_root.stem}_h2.npz"]
+    out_root = Path(output).expanduser().resolve()
+    return [out_root / f"{f.stem}_h2.npz" for f in csv_files]
 
 
 def _body_ids(model: mujoco.MjModel, names: tuple[str, ...]) -> dict[str, int]:
@@ -249,16 +313,25 @@ def _smooth_ground_lift(raw_lift: np.ndarray, window: int) -> np.ndarray:
 
 
 class _H2Ik:
-    """Damped-least-squares task-space IK over the H2 free base + 31 hinges."""
+    """Damped-least-squares task-space IK over the H2 free base + 29 hinges."""
 
-    def __init__(self, model: mujoco.MjModel, data: mujoco.MjData, damping: float, posture_w: float):
+    def __init__(
+        self,
+        model: mujoco.MjModel,
+        data: mujoco.MjData,
+        damping: float,
+        posture_w: float,
+        ori_bodies: dict[str, str],
+    ):
         self.model = model
         self.data = data
         self.damping = damping
         self.posture_w = posture_w
         self.body_ids = _body_ids(model, _TRACKED_BODIES)
+        h2_ori_ids = _body_ids(model, tuple(ori_bodies[name] for name in _ORI_WEIGHTS))
+        self.ori_body_ids = {name: h2_ori_ids[ori_bodies[name]] for name in _ORI_WEIGHTS}
         self.nv = model.nv
-        # hinge (qpos_adr, dof_adr) in model order + joint range clamps for the 31 hinges
+        # hinge (qpos_adr, dof_adr) in model order + joint range clamps for the 29 hinges
         self.hinges = _hinge_joint_readback(model)
         self.jnt_range = np.array(
             [model.jnt_range[jid] for jid in range(model.njnt)
@@ -299,7 +372,7 @@ class _H2Ik:
                 e[r:r + 3] = w * (tgt_pos[name] - data.xpos[bid])
                 r += 3
             for name, w in _ORI_WEIGHTS.items():
-                bid = self.body_ids[name]
+                bid = self.ori_body_ids[name]
                 mujoco.mj_jacBody(model, data, self._jacp, self._jacr, bid)
                 J[r:r + 3] = w * self._jacr
                 e[r:r + 3] = w * _quat_error_world(tgt_quat[name], data.xquat[bid])
@@ -334,6 +407,8 @@ def run_h2_ik_export(
     ground: bool = True,
     ground_tol: float = 0.0,
     ground_smooth: int = 5,
+    legacy_foot_ori: bool = False,
+    progress: bool = True,
 ) -> dict[str, float]:
     tmp_model_path, _, _ = inject_mujoco_tracking_sensors(h2_model_file)
     try:
@@ -352,12 +427,15 @@ def run_h2_ik_export(
     }
 
     inj = _map_csv_joints(model, list(loader.joint_names))       # 29 CSV joints -> H2 addrs
-    readback = _hinge_joint_readback(model)                       # 31 H2 hinges, model order
+    readback = _hinge_joint_readback(model)                       # 29 H2 hinges, model order
     sensor_adrs = _sensor_addr_table(model)
     num_frames = loader.output_frames
     num_joints = len(readback)
     num_bodies = model.nbody
-    ik = _H2Ik(model, data, damping=damping, posture_w=posture_w)
+    ik = _H2Ik(
+        model, data, damping=damping, posture_w=posture_w,
+        ori_bodies=_ORI_H2_BODY_LEGACY if legacy_foot_ori else _ORI_H2_BODY,
+    )
 
     # --- pass 1: solve H2 qpos per frame (warm-started from the previous solution) ---
     qpos_traj = np.zeros((num_frames, model.nq), dtype=np.float64)
@@ -365,7 +443,8 @@ def run_h2_ik_export(
     data.qpos[:] = model.qpos0
     err_accum = 0.0
     arm_err_accum = 0.0
-    for i in tqdm(range(num_frames), desc=f"{output_file.stem} ik", leave=False):
+    for i in tqdm(range(num_frames), desc=f"{output_file.stem} ik", leave=False,
+                  disable=not progress):
         g1_pos, g1_quat = source.poses(
             loader.motion_base_poss[i], loader.motion_base_rots[i], loader.motion_dof_poss[i]
         )
@@ -459,24 +538,46 @@ def run_h2_ik_export(
                 body_ang_vel_w[i, body_id] = data.sensordata[ang_adr:ang_adr + _SENSOR_DIMS[3]]
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        output_file,
-        fps=np.array([loader.output_fps], dtype=np.int32),
-        joint_pos=joint_pos,
-        joint_vel=joint_vel,
-        body_pos_w=body_pos_w,
-        body_quat_w=body_quat_w,
-        body_lin_vel_w=body_lin_vel_w,
-        body_ang_vel_w=body_ang_vel_w,
-    )
+    # Write to a hidden temp name and rename, so an interrupted run never leaves a truncated
+    # *.npz that --skip_existing or the training launcher's *.npz glob would pick up.
+    partial_file = output_file.with_name(f".{output_file.name}.partial")
+    with open(partial_file, "wb") as handle:
+        np.savez(
+            handle,
+            fps=np.array([loader.output_fps], dtype=np.int32),
+            joint_pos=joint_pos,
+            joint_vel=joint_vel,
+            body_pos_w=body_pos_w,
+            body_quat_w=body_quat_w,
+            body_lin_vel_w=body_lin_vel_w,
+            body_ang_vel_w=body_ang_vel_w,
+        )
+    os.replace(partial_file, output_file)
     return {
         "mean_foot_err": err_accum / max(num_frames, 1) if debug else float("nan"),
         "mean_arm_err": arm_err_accum / max(num_frames, 1) if debug else float("nan"),
     }
 
 
+def _convert_clip(
+    csv_file: Path,
+    output_file: Path,
+    g1_model_xml: str,
+    h2_model_xml: str,
+    loader_kwargs: dict,
+    export_kwargs: dict,
+    progress: bool,
+) -> dict[str, float]:
+    """Retarget one CSV clip (top-level so ProcessPoolExecutor workers can run it)."""
+    loader = MotionLoader(motion_file=csv_file, **loader_kwargs)
+    source = _SourceFK(g1_model_xml, list(loader.joint_names))
+    return run_h2_ik_export(
+        loader, source, h2_model_xml, output_file, progress=progress, **export_kwargs
+    )
+
+
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="IK-retarget G1 CSV motions to H2 31-DoF NPZ")
+    p = argparse.ArgumentParser(description="IK-retarget G1 CSV motions to H2 29-DoF NPZ")
     p.add_argument("--input", required=True, help="G1 CSV file or directory of CSV files")
     p.add_argument("--output", required=True, help="Output .npz (file input) or directory")
     p.add_argument("--g1_model_xml", default=DEFAULT_G1_MODEL, help="G1 scene_flat.xml (source FK)")
@@ -496,6 +597,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ground_tol", type=float, default=0.0, help="allowed foot penetration (m) before lifting")
     p.add_argument("--ground_smooth", type=int, default=5,
                    help="temporal window (frames) to smooth the grounding lift (1=off, per-frame)")
+    p.add_argument("--legacy_foot_ori", action="store_true",
+                   help="match foot orientation on H2 ankle_roll_link (old, incorrect behaviour)")
+    p.add_argument("--workers", type=int, default=1,
+                   help="parallel worker processes, one clip per task (1=serial)")
     p.add_argument("--limit", type=int, default=0, help="convert only the first N clips (0=all)")
     p.add_argument(
         "--skip_existing", action="store_true",
@@ -532,42 +637,71 @@ def main() -> None:
         print(f"[g1_csv_to_h2_npz2] dry-run OK. Example output: {output_files[0]}")
         return
 
+    export_kwargs = dict(
+        h_scale=h_scale, v_scale=v_scale, foot_offset=foot_offset, arm_scale=arm_scale,
+        damping=args.damping, posture_w=args.posture_w, iters=args.ik_iters,
+        warm_iters=args.warm_iters, debug=args.debug, ground=not args.no_ground,
+        ground_tol=args.ground_tol, ground_smooth=args.ground_smooth,
+        legacy_foot_ori=args.legacy_foot_ori,
+    )
+    loader_kwargs = dict(
+        input_fps=int(args.input_fps), output_fps=int(args.output_fps),
+        position_scale=args.position_scale, euler_order=args.euler_order,
+    )
+    print(f"[g1_csv_to_h2_npz2] foot orientation target: "
+          f"{'ankle_roll_link (legacy)' if args.legacy_foot_ori else 'ankle_pitch_link'}; "
+          f"workers={args.workers}")
+
     failures: list[tuple[Path, str]] = []
     skipped = 0
+    jobs: list[tuple[Path, Path]] = []
     for csv_file, output_file in zip(csv_files, output_files, strict=True):
         if args.skip_existing and output_file.exists():
             skipped += 1
-            continue
-        try:
-            loader = MotionLoader(
-                motion_file=csv_file,
-                input_fps=int(args.input_fps),
-                output_fps=int(args.output_fps),
-                position_scale=args.position_scale,
-                euler_order=args.euler_order,
-            )
-            source = _SourceFK(args.g1_model_xml, list(loader.joint_names))
-            stats = run_h2_ik_export(
-                loader, source, args.h2_model_xml, output_file,
-                h_scale=h_scale, v_scale=v_scale, foot_offset=foot_offset, arm_scale=arm_scale,
-                damping=args.damping, posture_w=args.posture_w, iters=args.ik_iters,
-                warm_iters=args.warm_iters, debug=args.debug, ground=not args.no_ground,
-                ground_tol=args.ground_tol, ground_smooth=args.ground_smooth,
-            )
-            if args.debug:
-                print(f"[g1_csv_to_h2_npz2] {output_file.name}: "
-                      f"mean_foot_err={stats['mean_foot_err']:.4f} m  "
-                      f"mean_arm_err={stats['mean_arm_err']:.4f} m")
-        except Exception as exc:  # keep going on a bad clip
-            failures.append((csv_file, str(exc)))
-            print(f"[g1_csv_to_h2_npz2] FAILED {csv_file.name}: {exc}")
+        else:
+            jobs.append((csv_file, output_file))
+
+    def report(output_file: Path, stats: dict[str, float]) -> None:
+        if args.debug:
+            tqdm.write(f"[g1_csv_to_h2_npz2] {output_file.name}: "
+                       f"mean_foot_err={stats['mean_foot_err']:.4f} m  "
+                       f"mean_arm_err={stats['mean_arm_err']:.4f} m")
+
+    if args.workers <= 1:
+        for csv_file, output_file in jobs:
+            try:
+                report(output_file, _convert_clip(
+                    csv_file, output_file, args.g1_model_xml, args.h2_model_xml,
+                    loader_kwargs, export_kwargs, True,
+                ))
+            except Exception as exc:  # keep going on a bad clip
+                failures.append((csv_file, str(exc)))
+                print(f"[g1_csv_to_h2_npz2] FAILED {csv_file.name}: {exc}")
+    else:
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            futures = {
+                pool.submit(
+                    _convert_clip, csv_file, output_file, args.g1_model_xml,
+                    args.h2_model_xml, loader_kwargs, export_kwargs, False,
+                ): (csv_file, output_file)
+                for csv_file, output_file in jobs
+            }
+            for future in tqdm(as_completed(futures), total=len(futures), desc="clips"):
+                csv_file, output_file = futures[future]
+                try:
+                    report(output_file, future.result())
+                except Exception as exc:  # keep going on a bad clip
+                    failures.append((csv_file, str(exc)))
+                    tqdm.write(f"[g1_csv_to_h2_npz2] FAILED {csv_file.name}: {exc}")
 
     ok = len(csv_files) - len(failures) - skipped
     print(f"[g1_csv_to_h2_npz2] done: {ok}/{len(csv_files)} converted -> {output_files[0].parent}")
     if skipped:
         print(f"[g1_csv_to_h2_npz2] {skipped} skipped (already existed)")
     if failures:
-        print(f"[g1_csv_to_h2_npz2] {len(failures)} failed")
+        print(f"[g1_csv_to_h2_npz2] {len(failures)} failed:")
+        for csv_file, message in failures:
+            print(f"    {csv_file}: {message}")
 
 
 if __name__ == "__main__":

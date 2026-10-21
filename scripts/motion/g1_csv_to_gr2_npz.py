@@ -24,7 +24,7 @@ from unilab.tools.bones_seed_csv import resolve_input_files
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bones_seed_csv_to_npz import MotionLoader  # noqa: E402
-from g1_csv_to_h2_npz import _SENSOR_DIMS, _sensor_addr_table  # noqa: E402
+from g1_csv_to_h2_npz2 import _SENSOR_DIMS, _sensor_addr_table  # noqa: E402
 
 DEFAULT_G1_MODEL = str(ASSETS_ROOT_PATH / "robots" / "g1" / "scene_flat.xml")
 DEFAULT_GR2_MODEL = str(ASSETS_ROOT_PATH / "robots" / "gr2" / "scene_flat.xml")
