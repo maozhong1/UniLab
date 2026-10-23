@@ -17,7 +17,8 @@ permutation (both perms stay False; everything is one self-consistent MuJoCo joi
 order). Critic uses the privileged_mf_hist path (1645 for n=29, nb=14), trained fresh.
 
 Action scale = 0.25 * effort / Kp in MJCF actuator order, from gear_sonic h2.py
-(reuses G1 PD/armature constants; effort ≈ 3x G1).
+(reuses G1 PD/armature constants; effort ≈ 3x G1), except the ankles (Kp 40) and wrist
+pitch/yaw (Kp 20), which use the joint actuatorfrcrange effort (stage 2.6 PD retune).
 """
 from __future__ import annotations
 
@@ -44,23 +45,25 @@ _GRAVITY = np.array([0.0, 0.0, -1.0], dtype=np.float32)
 
 # H2 SONIC residual-action scale = 0.25 * effort_limit / Kp, in H2 MJCF actuator order
 # (L-leg, R-leg, waist, L-arm, R-arm). Kp/effort from gear_sonic h2.py; must match
-# the <position kp forcerange> actuators authored in robots/h2/h2.xml.
+# the <position kp> actuators authored in robots/h2/h2.xml. Ankles (Kp 40) and wrist
+# pitch/yaw (Kp 20) use the joint actuatorfrcrange effort (19 / 66.88 / 25 N·m); resuming
+# an older checkpoint needs scripts/sonic/rescale_h2_action_ckpt.py.
 _SONIC_ACTION_SCALE_MUJOCO = np.array(
     [
         # left leg: hip_pitch, hip_roll, hip_yaw, knee, ankle_roll, ankle_pitch
         0.25 * 417.0 / 99.0984, 0.25 * 417.0 / 99.0984, 0.25 * 264.0 / 40.1792,
-        0.25 * 417.0 / 99.0984, 0.25 * 150.0 / 28.5012, 0.25 * 150.0 / 28.5012,
+        0.25 * 417.0 / 99.0984, 0.25 * 19.0 / 40.0, 0.25 * 66.88 / 40.0,
         # right leg
         0.25 * 417.0 / 99.0984, 0.25 * 417.0 / 99.0984, 0.25 * 264.0 / 40.1792,
-        0.25 * 417.0 / 99.0984, 0.25 * 150.0 / 28.5012, 0.25 * 150.0 / 28.5012,
+        0.25 * 417.0 / 99.0984, 0.25 * 19.0 / 40.0, 0.25 * 66.88 / 40.0,
         # waist: yaw, roll, pitch
         0.25 * 264.0 / 40.1792, 0.25 * 150.0 / 28.5012, 0.25 * 150.0 / 28.5012,
         # left arm: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw
         0.25 * 75.0 / 14.2506, 0.25 * 75.0 / 14.2506, 0.25 * 75.0 / 14.2506,
-        0.25 * 75.0 / 14.2506, 0.25 * 75.0 / 14.2506, 0.25 * 15.0 / 16.7783, 0.25 * 15.0 / 16.7783,
+        0.25 * 75.0 / 14.2506, 0.25 * 75.0 / 14.2506, 0.25 * 25.0 / 20.0, 0.25 * 25.0 / 20.0,
         # right arm
         0.25 * 75.0 / 14.2506, 0.25 * 75.0 / 14.2506, 0.25 * 75.0 / 14.2506,
-        0.25 * 75.0 / 14.2506, 0.25 * 75.0 / 14.2506, 0.25 * 15.0 / 16.7783, 0.25 * 15.0 / 16.7783,
+        0.25 * 75.0 / 14.2506, 0.25 * 75.0 / 14.2506, 0.25 * 25.0 / 20.0, 0.25 * 25.0 / 20.0,
     ],
     dtype=np.float32,
 )
@@ -94,9 +97,9 @@ class SonicRewardConfig(RewardConfig):
             **RewardConfig().scales,
             "motion_local_points": 2.0,
             "undesired_contacts": -0.1,
-            # Foot-slip / foot-yaw penalties. H2's single foot-mesh contact has no
-            # torsional friction, so a support foot can free-spin on turns and wreck
-            # motion_body_ang_vel tracking. These shape the *policy* (not the contact
+            # Foot-slip / foot-yaw penalties. The policy drags/spins the support foot
+            # (stance slip barely changed with friction or contact-model tweaks), which
+            # wrecks root and motion_body_ang_vel tracking. These shape the *policy* (not the contact
             # model), so train and deploy stay on the identical h2.xml. Default OFF;
             # enable per-run via reward.scales.feet_slide / feet_yaw (negative=penalty).
             "feet_slide": 0.0,
@@ -131,9 +134,13 @@ class SonicRewardConfig(RewardConfig):
     )
     std_local_points: float = 0.1
     std_upper_body_joint_pos: float = 0.2
-    # Robot foot world-z below this (flat ground) counts as "in contact" for the
-    # feet_slide / feet_yaw gates. Calibrate to H2 ankle_roll_link stance height.
-    feet_contact_height: float = 0.15
+    # feet_slide / feet_yaw gate: a foot is penalized only while the *reference* foot is
+    # planted (reference and robot ankle_roll_link world-z below feet_contact_height, and
+    # reference foot horizontal speed below feet_ref_stance_speed). H2's swing foot stays
+    # low, so a robot-height-only gate counted ~20-40% swing frames and would punish
+    # stepping. Reference stance z is ~0.05 m (p95 0.077) on the H2 walking clips.
+    feet_contact_height: float = 0.08
+    feet_ref_stance_speed: float = 0.1
     # Angular-speed / joint-speed deadzone (rad/s) for anti_shake_ang_vel. No penalty
     # below this, so intentional wrist/head motion is free; only jitter is punished.
     anti_shake_threshold: float = 1.5
@@ -223,13 +230,15 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
             }
         )
 
-        # feet_slide / feet_yaw penalty scratch (zero-alloc hot path). Contact is
-        # proxied by robot foot world-z < feet_contact_height (see SonicRewardConfig).
+        # feet_slide / feet_yaw penalty scratch (zero-alloc hot path). The gate is the
+        # reference stance (see _foot_stance_gate / SonicRewardConfig).
         _fdt = get_global_dtype()
         _nf = self._strict_foot_indices.size
         self._foot_xy_sq = np.empty((num_envs, _nf, 2), dtype=_fdt)
         self._foot_perfoot = np.empty((num_envs, _nf), dtype=_fdt)
+        self._foot_ref_speed_sq = np.empty((num_envs, _nf), dtype=_fdt)
         self._foot_gate = np.empty((num_envs, _nf), dtype=bool)
+        self._foot_gate_tmp = np.empty((num_envs, _nf), dtype=bool)
         self._foot_penalty_slide = np.empty((num_envs,), dtype=_fdt)
         self._foot_penalty_yaw = np.empty((num_envs,), dtype=_fdt)
 
@@ -597,45 +606,54 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
         return np.asarray(penalty, dtype=get_global_dtype())
 
     def _reward_feet_slide(self, ctx: Any) -> np.ndarray:
-        """Penalize horizontal foot velocity while the foot is near the ground.
+        """Penalize horizontal foot velocity while the reference foot is planted.
 
-        Contact is proxied by robot foot world-z < ``feet_contact_height`` (flat
-        ground; mirrors ``undesired_contacts``' height proxy, no contact sensor
-        needed). Returns the per-foot-mean horizontal speed² of *contacting* feet;
-        the negative ``feet_slide`` scale turns it into a slip penalty. Geometry-
-        agnostic — shapes the policy, not the contact model, so train == deploy.
+        Returns the per-foot-mean horizontal speed² of robot feet inside the
+        reference-stance gate (:meth:`_foot_stance_gate`); the negative ``feet_slide``
+        scale turns it into a slip penalty. Shapes the policy, not the contact model,
+        so train == deploy.
         """
         idx = self._strict_foot_indices
+        self._foot_stance_gate(ctx)
         np.square(ctx.robot_body_lin_vel_w[:, idx, :2], out=self._foot_xy_sq)
         np.sum(self._foot_xy_sq, axis=2, out=self._foot_perfoot)
-        np.less(
-            ctx.robot_body_pos_w[:, idx, 2],
-            self._cfg.reward_config.feet_contact_height,
-            out=self._foot_gate,
-        )
         self._foot_perfoot *= self._foot_gate
         np.sum(self._foot_perfoot, axis=1, out=self._foot_penalty_slide)
         self._foot_penalty_slide /= idx.size
         return self._foot_penalty_slide
 
     def _reward_feet_yaw(self, ctx: Any) -> np.ndarray:
-        """Penalize foot yaw-rate (spin about vertical) while near the ground.
+        """Penalize foot yaw-rate error vs the reference while the reference foot is planted.
 
-        Same contact-height proxy as :meth:`_reward_feet_slide`. Directly targets
-        the ``motion_body_ang_vel`` failure mode where H2's single-mesh foot, having
-        no torsional friction, free-spins during single-support turns.
+        Same gate as :meth:`_reward_feet_slide`. Penalizes (robot − reference) foot
+        yaw-rate² so intended pivots in the reference stay free, while targeting the
+        ``motion_body_ang_vel`` failure mode where the support foot free-spins
+        during single-support turns.
         """
         idx = self._strict_foot_indices
-        np.square(ctx.robot_body_ang_vel_w[:, idx, 2], out=self._foot_perfoot)
-        np.less(
-            ctx.robot_body_pos_w[:, idx, 2],
-            self._cfg.reward_config.feet_contact_height,
-            out=self._foot_gate,
+        self._foot_stance_gate(ctx)
+        np.subtract(
+            ctx.robot_body_ang_vel_w[:, idx, 2],
+            ctx.motion_data.body_ang_vel_w[:, idx, 2],
+            out=self._foot_perfoot,
         )
+        np.square(self._foot_perfoot, out=self._foot_perfoot)
         self._foot_perfoot *= self._foot_gate
         np.sum(self._foot_perfoot, axis=1, out=self._foot_penalty_yaw)
         self._foot_penalty_yaw /= idx.size
         return self._foot_penalty_yaw
+
+    def _foot_stance_gate(self, ctx: Any) -> None:
+        """Write the reference-stance gate into ``self._foot_gate`` (zero-alloc)."""
+        idx = self._strict_foot_indices
+        rc = self._cfg.reward_config
+        np.less(ctx.robot_body_pos_w[:, idx, 2], rc.feet_contact_height, out=self._foot_gate)
+        np.less(ctx.motion_data.body_pos_w[:, idx, 2], rc.feet_contact_height, out=self._foot_gate_tmp)
+        self._foot_gate &= self._foot_gate_tmp
+        np.square(ctx.motion_data.body_lin_vel_w[:, idx, :2], out=self._foot_xy_sq)
+        np.sum(self._foot_xy_sq, axis=2, out=self._foot_ref_speed_sq)
+        np.less(self._foot_ref_speed_sq, rc.feet_ref_stance_speed**2, out=self._foot_gate_tmp)
+        self._foot_gate &= self._foot_gate_tmp
 
     def _reward_motion_local_points(self, ctx: Any) -> np.ndarray:
         ref_pos = ctx.motion_data.body_pos_w[:, self._strict_local_point_indices]

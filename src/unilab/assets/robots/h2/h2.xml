@@ -1,6 +1,6 @@
 <mujoco model="h2">
   <compiler angle="radian" meshdir="assets" autolimits="true" />
-  <option integrator="implicitfast" timestep="0.005" />
+  <option integrator="implicitfast" timestep="0.005" cone="elliptic" impratio="10" />
   <asset>
     <mesh name="pelvis" content_type="model/stl" file="pelvis.stl" />
     <mesh name="pelvis_collision_link" content_type="model/stl" file="pelvis_collision.stl" />
@@ -73,7 +73,12 @@
                   <inertial pos="0.032059 0.0370053 -0.0288282" quat="6.19452e-05 0.72345 -3.0004e-05 0.690377" mass="0.844967" diaginertia="0.00438317 0.00410964 0.000599978" />
                   <joint name="left_ankle_pitch_joint" pos="0 0 0" axis="0 1 0" range="-1.13446 0.610865" actuatorfrcrange="-66.88 66.88" armature="0.00721945" frictionloss="0.3" />
                   <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.4 0.4 0.4 1" mesh="left_ankle_pitch_link" />
-                  <geom type="mesh" rgba="0.4 0.4 0.4 1" mesh="left_ankle_pitch_link" contype="1" conaffinity="0" condim="6" friction="1.0 0.05 0.0001" priority="1" />
+                  <!-- Sole contact: 4 corner spheres (G1-style) instead of the convex foot mesh.
+                       Sphere bottoms sit on the mesh sole plane (z = -0.0543), so stance height is unchanged. -->
+                  <geom name="left_foot1_collision" type="sphere" size="0.005" pos="-0.062 0.01 -0.0493" contype="1" conaffinity="0" condim="3" friction="1.0" priority="1" rgba="0.8 0.2 0.2 1" />
+                  <geom name="left_foot2_collision" type="sphere" size="0.005" pos="-0.062 0.065 -0.0493" contype="1" conaffinity="0" condim="3" friction="1.0" priority="1" rgba="0.8 0.2 0.2 1" />
+                  <geom name="left_foot3_collision" type="sphere" size="0.005" pos="0.142 0.01 -0.0493" contype="1" conaffinity="0" condim="3" friction="1.0" priority="1" rgba="0.8 0.2 0.2 1" />
+                  <geom name="left_foot4_collision" type="sphere" size="0.005" pos="0.142 0.065 -0.0493" contype="1" conaffinity="0" condim="3" friction="1.0" priority="1" rgba="0.8 0.2 0.2 1" />
                   <site name="left_foot" size="0.01" pos="0.03 0.03 -0.03" rgba="1 0 0 1" />
                 </body>
               </body>
@@ -109,7 +114,12 @@
                   <inertial pos="0.032059 -0.0370053 -0.0288282" quat="-6.19452e-05 0.72345 3.0004e-05 0.690377" mass="0.844967" diaginertia="0.00438317 0.00410964 0.000599978" />
                   <joint name="right_ankle_pitch_joint" pos="0 0 0" axis="0 1 0" range="-1.13446 0.610865" actuatorfrcrange="-66.88 66.88" armature="0.00721945" frictionloss="0.3" />
                   <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.4 0.4 0.4 1" mesh="right_ankle_pitch_link" />
-                  <geom type="mesh" rgba="0.4 0.4 0.4 1" mesh="right_ankle_pitch_link" contype="1" conaffinity="0" condim="6" friction="1.0 0.05 0.0001" priority="1" />
+                  <!-- Sole contact: 4 corner spheres (G1-style) instead of the convex foot mesh.
+                       Sphere bottoms sit on the mesh sole plane (z = -0.0543), so stance height is unchanged. -->
+                  <geom name="right_foot1_collision" type="sphere" size="0.005" pos="-0.062 -0.01 -0.0493" contype="1" conaffinity="0" condim="3" friction="1.0" priority="1" rgba="0.8 0.2 0.2 1" />
+                  <geom name="right_foot2_collision" type="sphere" size="0.005" pos="-0.062 -0.065 -0.0493" contype="1" conaffinity="0" condim="3" friction="1.0" priority="1" rgba="0.8 0.2 0.2 1" />
+                  <geom name="right_foot3_collision" type="sphere" size="0.005" pos="0.142 -0.01 -0.0493" contype="1" conaffinity="0" condim="3" friction="1.0" priority="1" rgba="0.8 0.2 0.2 1" />
+                  <geom name="right_foot4_collision" type="sphere" size="0.005" pos="0.142 -0.065 -0.0493" contype="1" conaffinity="0" condim="3" friction="1.0" priority="1" rgba="0.8 0.2 0.2 1" />
                   <site name="right_foot" size="0.01" pos="0.03 0.03 -0.03" rgba="1 0 0 1" />
                 </body>
               </body>
@@ -235,14 +245,14 @@
     <position name="left_hip_roll" joint="left_hip_roll_joint" kp="99.0984" kv="6.3088" forcerange="-417 417" />
     <position name="left_hip_yaw" joint="left_hip_yaw_joint" kp="40.1792" kv="2.5579" forcerange="-264 264" />
     <position name="left_knee" joint="left_knee_joint" kp="99.0984" kv="6.3088" forcerange="-417 417" />
-    <position name="left_ankle_roll" joint="left_ankle_roll_joint" kp="28.5012" kv="1.8144" forcerange="-150 150" />
-    <position name="left_ankle_pitch" joint="left_ankle_pitch_joint" kp="28.5012" kv="1.8144" forcerange="-150 150" />
+    <position name="left_ankle_roll" joint="left_ankle_roll_joint" kp="40" kv="2" forcerange="-150 150" />
+    <position name="left_ankle_pitch" joint="left_ankle_pitch_joint" kp="40" kv="2" forcerange="-150 150" />
     <position name="right_hip_pitch" joint="right_hip_pitch_joint" kp="99.0984" kv="6.3088" forcerange="-417 417" />
     <position name="right_hip_roll" joint="right_hip_roll_joint" kp="99.0984" kv="6.3088" forcerange="-417 417" />
     <position name="right_hip_yaw" joint="right_hip_yaw_joint" kp="40.1792" kv="2.5579" forcerange="-264 264" />
     <position name="right_knee" joint="right_knee_joint" kp="99.0984" kv="6.3088" forcerange="-417 417" />
-    <position name="right_ankle_roll" joint="right_ankle_roll_joint" kp="28.5012" kv="1.8144" forcerange="-150 150" />
-    <position name="right_ankle_pitch" joint="right_ankle_pitch_joint" kp="28.5012" kv="1.8144" forcerange="-150 150" />
+    <position name="right_ankle_roll" joint="right_ankle_roll_joint" kp="40" kv="2" forcerange="-150 150" />
+    <position name="right_ankle_pitch" joint="right_ankle_pitch_joint" kp="40" kv="2" forcerange="-150 150" />
     <position name="waist_yaw" joint="waist_yaw_joint" kp="40.1792" kv="2.5579" forcerange="-264 264" />
     <position name="waist_roll" joint="waist_roll_joint" kp="28.5012" kv="1.8144" forcerange="-150 150" />
     <position name="waist_pitch" joint="waist_pitch_joint" kp="28.5012" kv="1.8144" forcerange="-150 150" />
@@ -251,15 +261,15 @@
     <position name="left_shoulder_yaw" joint="left_shoulder_yaw_joint" kp="14.2506" kv="0.9072" forcerange="-75 75" />
     <position name="left_elbow" joint="left_elbow_joint" kp="14.2506" kv="0.9072" forcerange="-75 75" />
     <position name="left_wrist_roll" joint="left_wrist_roll_joint" kp="14.2506" kv="0.9072" forcerange="-75 75" />
-    <position name="left_wrist_pitch" joint="left_wrist_pitch_joint" kp="16.7783" kv="1.0681" forcerange="-15 15" />
-    <position name="left_wrist_yaw" joint="left_wrist_yaw_joint" kp="16.7783" kv="1.0681" forcerange="-15 15" />
+    <position name="left_wrist_pitch" joint="left_wrist_pitch_joint" kp="20" kv="1" forcerange="-15 15" />
+    <position name="left_wrist_yaw" joint="left_wrist_yaw_joint" kp="20" kv="1" forcerange="-15 15" />
     <position name="right_shoulder_pitch" joint="right_shoulder_pitch_joint" kp="14.2506" kv="0.9072" forcerange="-75 75" />
     <position name="right_shoulder_roll" joint="right_shoulder_roll_joint" kp="14.2506" kv="0.9072" forcerange="-75 75" />
     <position name="right_shoulder_yaw" joint="right_shoulder_yaw_joint" kp="14.2506" kv="0.9072" forcerange="-75 75" />
     <position name="right_elbow" joint="right_elbow_joint" kp="14.2506" kv="0.9072" forcerange="-75 75" />
     <position name="right_wrist_roll" joint="right_wrist_roll_joint" kp="14.2506" kv="0.9072" forcerange="-75 75" />
-    <position name="right_wrist_pitch" joint="right_wrist_pitch_joint" kp="16.7783" kv="1.0681" forcerange="-15 15" />
-    <position name="right_wrist_yaw" joint="right_wrist_yaw_joint" kp="16.7783" kv="1.0681" forcerange="-15 15" />
+    <position name="right_wrist_pitch" joint="right_wrist_pitch_joint" kp="20" kv="1" forcerange="-15 15" />
+    <position name="right_wrist_yaw" joint="right_wrist_yaw_joint" kp="20" kv="1" forcerange="-15 15" />
   </actuator>
   <sensor>
     <velocimeter site="imu" name="pelvis_local_linvel" />

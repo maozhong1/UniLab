@@ -79,8 +79,8 @@ reward:
     # upper_body_joint_pos tracks the 14 shoulder/elbow/wrist joints. Default 0.0 = OFF.
     target_rate_l2: 0.0
     upper_body_joint_pos: 0.0
-    # Foot-slip / foot-yaw penalties (H2 single foot-mesh has no torsional friction ->
-    # support foot free-spins on turns, wrecking motion_body_ang_vel). Declared here so
+    # Foot-slip / foot-yaw penalties (the policy drags / free-spins the support foot on
+    # turns, wrecking root and motion_body_ang_vel tracking). Declared here so
     # per-run CLI (reward.scales.feet_slide=... ) can override; default 0.0 = OFF.
     feet_slide: 0.0
     feet_yaw: 0.0

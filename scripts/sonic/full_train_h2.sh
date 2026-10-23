@@ -3,8 +3,12 @@ set -euo pipefail
 
 # H2 (29-DOF, head welded like Unitree G1) SONIC curriculum training.
 # Stage 1 starts from scratch. Later stages require LOAD_RUN and resume its newest
-# checkpoint unless CHECKPOINT is set. Stages 2.5 and 2.8 merge manipulation clips
+# checkpoint unless CHECKPOINT is set. Stages 2.5, 2.6 and 2.8 merge manipulation clips
 # into the base dataset before filtering. Set NPZ_DIR to bypass filtering.
+# Stage 2.6 = stage 2.5 data under the retuned ankle (Kp 40) / wrist pitch-yaw (Kp 20) PD
+# and 4-sphere sole contact (elliptic cone),
+# plus reference-stance feet_slide/feet_yaw. Resume it from a checkpoint converted with
+# scripts/sonic/rescale_h2_action_ckpt.py (the action scale changed for those joints).
 #   task:   h2_motion_tracking/sonic_full_train (H2SonicMotionTracking env)
 #   actor:  SonicH2ActorModel, obs 1570 = enc(640)+proprio(930), action 29
 #   critic: 1645 privileged_mf_hist (+env.critic_privileged_mf_hist=true), fresh
@@ -21,14 +25,48 @@ SAVE_INTERVAL="${SAVE_INTERVAL:-100}"
 WORK_DIR="${WORK_DIR:-/tmp/sonic_train}"
 
 if [[ "$CURRICULUM_STAGE" == "2.8" ]]; then
-  DEFAULT_LEARNING_RATE=7.5e-6
-  DEFAULT_ADAPTIVE_LR_MAX=1e-5
-  DEFAULT_ENTROPY_COEF=0.001
-  DEFAULT_ROOT_POS_SCALE=0.75
+  # The adaptive-KL schedule floors the LR at 1e-5, so a lower base LR is a no-op. Stage 2.5
+  # oscillated 1e-5..2.25e-5; the 3e-5 ceiling only guards against a ramp when KL collapses
+  # as action std shrinks. target_rate stays at the 2.6 value (arms are only ~22% of it;
+  # legs/ankles/waist share the rest). Root position and upper-body joints are up-weighted
+  # because both still track poorly after 2.6 (upper-body reward flat at ~0.41).
+  DEFAULT_LEARNING_RATE=1e-5
+  DEFAULT_ADAPTIVE_LR_MAX=3e-5
+  DEFAULT_ENTROPY_COEF=0.002
+  DEFAULT_ROOT_POS_SCALE=1.0
   DEFAULT_ACTION_RATE_L2_SCALE=0.0
   DEFAULT_TARGET_RATE_L2_SCALE=-0.02
   DEFAULT_UPPER_BODY_JOINT_POS_SCALE=1.0
-  DEFAULT_ANTI_SHAKE_ANG_VEL_SCALE=0.0
+  DEFAULT_ANTI_SHAKE_ANG_VEL_SCALE=-2.5e-3
+  # Carry the stage 2.6 foot-slip terms and upper-body std forward (dropping them would
+  # silently undo 2.6), and burn the critic in on the ~230 harder clips 2.8 adds.
+  DEFAULT_FEET_SLIDE_SCALE=-1.0
+  DEFAULT_FEET_YAW_SCALE=-0.1
+  DEFAULT_STD_UPPER_BODY_JOINT_POS=0.5
+  DEFAULT_CRITIC_WARMUP=50
+  # 2.6 eval: backward stance slip did not improve (rare in the data: backward
+  # ~1.3%, sideways ~15% of 2.8 clips), so give them extra weight.
+  DEFAULT_EXTRA_FOCUS='walk_backward_*:2'
+  DEFAULT_FOCUS_PATTERN='*macarena*.npz'
+  DEFAULT_FOCUS_REPEAT=5
+elif [[ "$CURRICULUM_STAGE" == "2.6" ]]; then
+  # Same data and reward base as 2.5. New: foot-slip penalties, and a wider upper-body
+  # joint std (0.2 rad saturated the reward to ~0 on manipulation/dance clips, whose
+  # arm error is ~0.3-0.5 rad, leaving no gradient). Critic burn-in for the PD change.
+  # Foot terms sized from the first 2.6 run: at -0.2 / -0.05 they logged -0.009 / -0.04
+  # against ~4.2 of tracking reward (feet_slide 0.2%, below every smoothness term).
+  DEFAULT_LEARNING_RATE=1e-5
+  DEFAULT_ADAPTIVE_LR_MAX=3e-5
+  DEFAULT_ENTROPY_COEF=0.003
+  DEFAULT_ROOT_POS_SCALE=0.75
+  DEFAULT_ACTION_RATE_L2_SCALE=0.0
+  DEFAULT_TARGET_RATE_L2_SCALE=-0.05
+  DEFAULT_UPPER_BODY_JOINT_POS_SCALE=0.5
+  DEFAULT_ANTI_SHAKE_ANG_VEL_SCALE=-2.5e-3
+  DEFAULT_FEET_SLIDE_SCALE=-1.0
+  DEFAULT_FEET_YAW_SCALE=-0.1
+  DEFAULT_STD_UPPER_BODY_JOINT_POS=0.5
+  DEFAULT_CRITIC_WARMUP=50
   DEFAULT_FOCUS_PATTERN='*macarena*.npz'
   DEFAULT_FOCUS_REPEAT=5
 elif [[ "$CURRICULUM_STAGE" == "2.5" ]]; then
@@ -60,6 +98,12 @@ else
   DEFAULT_FOCUS_REPEAT=5
 fi
 
+DEFAULT_FEET_SLIDE_SCALE="${DEFAULT_FEET_SLIDE_SCALE:-0.0}"
+DEFAULT_FEET_YAW_SCALE="${DEFAULT_FEET_YAW_SCALE:-0.0}"
+DEFAULT_STD_UPPER_BODY_JOINT_POS="${DEFAULT_STD_UPPER_BODY_JOINT_POS:-0.2}"
+DEFAULT_CRITIC_WARMUP="${DEFAULT_CRITIC_WARMUP:-0}"
+DEFAULT_EXTRA_FOCUS="${DEFAULT_EXTRA_FOCUS:-}"
+
 # Stage 1 is the calm from-scratch stage; its filter drops every macarena clip, so disable
 # focus here to avoid a spurious "matched no clips" warning (stage 2/3/full keep it).
 if [[ "$CURRICULUM_STAGE" == "1" ]]; then
@@ -74,12 +118,26 @@ ACTION_RATE_L2_SCALE="${ACTION_RATE_L2_SCALE:-$DEFAULT_ACTION_RATE_L2_SCALE}"
 TARGET_RATE_L2_SCALE="${TARGET_RATE_L2_SCALE:-$DEFAULT_TARGET_RATE_L2_SCALE}"
 UPPER_BODY_JOINT_POS_SCALE="${UPPER_BODY_JOINT_POS_SCALE:-$DEFAULT_UPPER_BODY_JOINT_POS_SCALE}"
 ANTI_SHAKE_ANG_VEL_SCALE="${ANTI_SHAKE_ANG_VEL_SCALE:-$DEFAULT_ANTI_SHAKE_ANG_VEL_SCALE}"
+FEET_SLIDE_SCALE="${FEET_SLIDE_SCALE:-$DEFAULT_FEET_SLIDE_SCALE}"
+FEET_YAW_SCALE="${FEET_YAW_SCALE:-$DEFAULT_FEET_YAW_SCALE}"
+STD_UPPER_BODY_JOINT_POS="${STD_UPPER_BODY_JOINT_POS:-$DEFAULT_STD_UPPER_BODY_JOINT_POS}"
 FOCUS_PATTERN="${FOCUS_PATTERN:-$DEFAULT_FOCUS_PATTERN}"
 FOCUS_REPEAT="${FOCUS_REPEAT:-$DEFAULT_FOCUS_REPEAT}"
+# Extra per-pattern oversampling on top of FOCUS_PATTERN: space-separated "glob:repeat"
+# entries matched against the stage's unique clips, e.g. 'walk_backward_*:2'. Set to a
+# single space to disable a stage default.
+EXTRA_FOCUS="${EXTRA_FOCUS:-$DEFAULT_EXTRA_FOCUS}"
+read -ra EXTRA_FOCUS_SPECS <<< "$EXTRA_FOCUS"
+for spec in "${EXTRA_FOCUS_SPECS[@]}"; do
+  if [[ "$spec" != *:* || ! "${spec##*:}" =~ ^[1-9][0-9]*$ || -z "${spec%:*}" ]]; then
+    echo "ERROR: EXTRA_FOCUS entries must be glob:repeat with a positive repeat: $spec" >&2
+    exit 2
+  fi
+done
 INIT_STD="${INIT_STD:-0.50}"
 # Resume-only: freeze the actor for N iterations so the critic re-fits first (e.g. after the
-# motion data changes under a warm policy). 0 = off.
-CRITIC_WARMUP="${CRITIC_WARMUP:-0}"
+# motion data or PD gains change under a warm policy). 0 = off.
+CRITIC_WARMUP="${CRITIC_WARMUP:-$DEFAULT_CRITIC_WARMUP}"
 
 if [[ "$CURRICULUM_STAGE" == "3" ]]; then
   DEFAULT_STRICT_FOOT_POS_THRESHOLD=0.45
@@ -118,7 +176,7 @@ if [[ -z "${NPZ_DIR:-}" ]]; then
         --base-z-range 0.25 --foot-height-max 0.45
       )
       ;;
-    2.5)
+    2.5|2.6)
       FILTER_ARGS=(
         --body-ang-p99 9.0 --joint-vel-p99 7.5
         --base-lin-p99 2.0 --base-ang-p99 3.0
@@ -143,7 +201,7 @@ if [[ -z "${NPZ_DIR:-}" ]]; then
       FILTER_ARGS=()
       ;;
     *)
-      echo "ERROR: CURRICULUM_STAGE must be 1, 2, 2.5, 2.8, 3, or full" >&2
+      echo "ERROR: CURRICULUM_STAGE must be 1, 2, 2.5, 2.6, 2.8, 3, or full" >&2
       exit 2
       ;;
   esac
@@ -153,7 +211,7 @@ if [[ -z "${NPZ_DIR:-}" ]]; then
   else
     FILTER_SOURCE_DIR="$SOURCE_NPZ_DIR"
     STAGE_DIR_SUFFIX="${CURRICULUM_STAGE//./_}"
-    if [[ "$CURRICULUM_STAGE" == "2.5" || "$CURRICULUM_STAGE" == "2.8" ]]; then
+    if [[ "$CURRICULUM_STAGE" == "2.5" || "$CURRICULUM_STAGE" == "2.6" || "$CURRICULUM_STAGE" == "2.8" ]]; then
       FILTER_SOURCE_DIR="$WORK_DIR/h2_stage${STAGE_DIR_SUFFIX}_source"
       mkdir -p "$FILTER_SOURCE_DIR"
       for existing in "$FILTER_SOURCE_DIR"/*.npz; do
@@ -202,6 +260,8 @@ if [[ ${#NPZ_FILES[@]} -eq 0 ]]; then
   exit 1
 fi
 
+UNIQUE_NPZ_FILES=("${NPZ_FILES[@]}")
+
 if [[ -n "$FOCUS_PATTERN" && "$FOCUS_REPEAT" -gt 1 ]]; then
   FOCUS_FILES=()
   for path in "${NPZ_FILES[@]}"; do
@@ -242,6 +302,25 @@ PY
     echo "oversampled ${#FOCUS_FILES[@]} focus clips ${FOCUS_REPEAT}x ($FOCUS_PATTERN), effective frame share ${EFFECTIVE_FOCUS_PERCENT}%"
   fi
 fi
+
+for spec in "${EXTRA_FOCUS_SPECS[@]}"; do
+  pattern="${spec%:*}"
+  extra_repeat="${spec##*:}"
+  EXTRA_FILES=()
+  for path in "${UNIQUE_NPZ_FILES[@]}"; do
+    if [[ "${path##*/}" == $pattern ]]; then
+      EXTRA_FILES+=("$path")
+    fi
+  done
+  if [[ ${#EXTRA_FILES[@]} -eq 0 ]]; then
+    echo "WARNING: EXTRA_FOCUS pattern matched no clips in this stage, skipping: $pattern" >&2
+    continue
+  fi
+  for ((repeat = 1; repeat < extra_repeat; repeat++)); do
+    NPZ_FILES+=("${EXTRA_FILES[@]}")
+  done
+  echo "oversampled ${#EXTRA_FILES[@]} extra-focus clips ${extra_repeat}x ($pattern)"
+done
 
 # Keep the 3000+ paths out of argv (Linux MAX_ARG_STRLEN) by composing a
 # temporary Hydra config through hydra.searchpath.
@@ -309,6 +388,9 @@ TRAIN_ARGS=(
   reward.scales.joint_acc_l2=-2.5e-7
   reward.scales.joint_torque_l2=-1.0e-6
   "reward.scales.anti_shake_ang_vel=$ANTI_SHAKE_ANG_VEL_SCALE"
+  "reward.scales.feet_slide=$FEET_SLIDE_SCALE"
+  "reward.scales.feet_yaw=$FEET_YAW_SCALE"
+  "reward.std_upper_body_joint_pos=$STD_UPPER_BODY_JOINT_POS"
   "env.strict_foot_pos_threshold=$STRICT_FOOT_POS_THRESHOLD"
   "env.strict_anchor_ori_error_sq=$STRICT_ANCHOR_ORI_ERROR_SQ"
   "env.strict_height_threshold=$STRICT_HEIGHT_THRESHOLD"
@@ -323,7 +405,7 @@ TRAIN_ARGS=(
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   uv run --no-sync python scripts/train_rsl_rl.py "${TRAIN_ARGS[@]}" --cfg job >/dev/null
-  echo "Hydra compose passed (stage=$CURRICULUM_STAGE, motion_entries=${#NPZ_FILES[@]}, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD)"
+  echo "Hydra compose passed (stage=$CURRICULUM_STAGE, motion_entries=${#NPZ_FILES[@]}, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, extra_focus=[$EXTRA_FOCUS], lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, feet_slide=$FEET_SLIDE_SCALE, feet_yaw=$FEET_YAW_SCALE, std_upper=$STD_UPPER_BODY_JOINT_POS, critic_warmup=$CRITIC_WARMUP, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD)"
   exit 0
 fi
 
@@ -331,4 +413,4 @@ LOG="$WORK_DIR/full_train_h2_stage${CURRICULUM_STAGE}_$(date +%Y%m%d_%H%M%S).log
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 setsid nohup uv run --no-sync python scripts/train_rsl_rl.py "${TRAIN_ARGS[@]}" \
   > "$LOG" 2>&1 < /dev/null &
-echo "launched H2 stage $CURRICULUM_STAGE (${#NPZ_FILES[@]} motion entries, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD), log=$LOG"
+echo "launched H2 stage $CURRICULUM_STAGE (${#NPZ_FILES[@]} motion entries, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, extra_focus=[$EXTRA_FOCUS], lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, feet_slide=$FEET_SLIDE_SCALE, feet_yaw=$FEET_YAW_SCALE, std_upper=$STD_UPPER_BODY_JOINT_POS, critic_warmup=$CRITIC_WARMUP, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD), log=$LOG"
