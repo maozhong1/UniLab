@@ -16,9 +16,8 @@ From-scratch training only (no G1 ``last.pt`` in H2 joint layout): NO MuJoCo<->I
 permutation (both perms stay False; everything is one self-consistent MuJoCo joint
 order). Critic uses the privileged_mf_hist path (1645 for n=29, nb=14), trained fresh.
 
-Action scale = 0.25 * effort / Kp in MJCF actuator order, from gear_sonic h2.py
-(reuses G1 PD/armature constants; effort ≈ 3x G1), except the ankles (Kp 40) and wrist
-pitch/yaw (Kp 20), which use the joint actuatorfrcrange effort (stage 2.6 PD retune).
+Action scale = 0.25 * effort / Kp in MJCF actuator order, from Unitree's official H2
+Kp/Kd/effort on every joint except ankle pitch (Kp 70, above the official 40).
 """
 from __future__ import annotations
 
@@ -44,26 +43,31 @@ _ANCHOR_ORI6 = 6
 _GRAVITY = np.array([0.0, 0.0, -1.0], dtype=np.float32)
 
 # H2 SONIC residual-action scale = 0.25 * effort_limit / Kp, in H2 MJCF actuator order
-# (L-leg, R-leg, waist, L-arm, R-arm). Kp/effort from gear_sonic h2.py; must match
-# the <position kp> actuators authored in robots/h2/h2.xml. Ankles (Kp 40) and wrist
-# pitch/yaw (Kp 20) use the joint actuatorfrcrange effort (19 / 66.88 / 25 N·m); resuming
-# an older checkpoint needs scripts/sonic/rescale_h2_action_ckpt.py.
+# (L-leg, R-leg, waist, L-arm, R-arm). Must match the <position kp> actuators authored
+# in robots/h2/h2.xml. Gains are Unitree's official H2 values (unitree_rl_mjlab
+# h2_constants.py, also the released SONIC_unitree_h2 "h2_native" profile): hips/knees
+# Kp 200 / effort 360. Checkpoints trained with other gains are not compatible.
+_HIP_KNEE_KP = (200.0, 200.0, 200.0, 200.0)  # hip_pitch, hip_roll, hip_yaw, knee
+_HP, _HR, _HY, _KN = (0.25 * 360.0 / kp for kp in _HIP_KNEE_KP)
+# Ankle pitch is above the official Kp 40 / Kd 2 at Kp 70 / Kd 3.5: at Kp 40 a standing H2
+# holds a 0.5-1.1 rad ankle PD error and creeps forward after a clip ends. Must
+# match robots/h2/h2.xml and the deploy contract (gear_sonic_deploy h2_contract.hpp, h2.xml).
+_ANKLE_PITCH_KP = 70.0
+_AP = 0.25 * 66.88 / _ANKLE_PITCH_KP
 _SONIC_ACTION_SCALE_MUJOCO = np.array(
     [
         # left leg: hip_pitch, hip_roll, hip_yaw, knee, ankle_roll, ankle_pitch
-        0.25 * 417.0 / 99.0984, 0.25 * 417.0 / 99.0984, 0.25 * 264.0 / 40.1792,
-        0.25 * 417.0 / 99.0984, 0.25 * 19.0 / 40.0, 0.25 * 66.88 / 40.0,
+        _HP, _HR, _HY, _KN, 0.25 * 19.0 / 40.0, _AP,
         # right leg
-        0.25 * 417.0 / 99.0984, 0.25 * 417.0 / 99.0984, 0.25 * 264.0 / 40.1792,
-        0.25 * 417.0 / 99.0984, 0.25 * 19.0 / 40.0, 0.25 * 66.88 / 40.0,
+        _HP, _HR, _HY, _KN, 0.25 * 19.0 / 40.0, _AP,
         # waist: yaw, roll, pitch
-        0.25 * 264.0 / 40.1792, 0.25 * 150.0 / 28.5012, 0.25 * 150.0 / 28.5012,
+        0.25 * 120.0 / 150.0, 0.25 * 120.0 / 150.0, 0.25 * 120.0 / 150.0,
         # left arm: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw
-        0.25 * 75.0 / 14.2506, 0.25 * 75.0 / 14.2506, 0.25 * 75.0 / 14.2506,
-        0.25 * 75.0 / 14.2506, 0.25 * 75.0 / 14.2506, 0.25 * 25.0 / 20.0, 0.25 * 25.0 / 20.0,
+        0.25 * 54.0 / 40.0, 0.25 * 54.0 / 40.0, 0.25 * 54.0 / 40.0,
+        0.25 * 54.0 / 40.0, 0.25 * 54.0 / 40.0, 0.25 * 25.0 / 20.0, 0.25 * 25.0 / 20.0,
         # right arm
-        0.25 * 75.0 / 14.2506, 0.25 * 75.0 / 14.2506, 0.25 * 75.0 / 14.2506,
-        0.25 * 75.0 / 14.2506, 0.25 * 75.0 / 14.2506, 0.25 * 25.0 / 20.0, 0.25 * 25.0 / 20.0,
+        0.25 * 54.0 / 40.0, 0.25 * 54.0 / 40.0, 0.25 * 54.0 / 40.0,
+        0.25 * 54.0 / 40.0, 0.25 * 54.0 / 40.0, 0.25 * 25.0 / 20.0, 0.25 * 25.0 / 20.0,
     ],
     dtype=np.float32,
 )
@@ -121,7 +125,7 @@ class SonicRewardConfig(RewardConfig):
             "joint_acc_l2": -2.5e-7,
             "joint_torque_l2": -1.0e-6,
             "anti_shake_ang_vel": -5.0e-3,
-            # ── Curriculum terms (enabled from stage 2.5 by full_train_h2.sh) ──
+            # ── Curriculum terms (enabled per stage by the launch scripts) ──
             #   target_rate_l2       : squared change in the physical PD position target
             #                          (action_scale·Δaction); replaces action_rate_l2
             #                          once the policy is stable, smoother in torque space.
@@ -130,20 +134,34 @@ class SonicRewardConfig(RewardConfig):
             #                          manipulation). Neither term changes obs/action/ckpt.
             "target_rate_l2": 0.0,
             "upper_body_joint_pos": 0.0,
+            # joint_soft_limit: linear penalty on joint position outside the central
+            # soft_joint_limit_factor of each joint range. The policy otherwise leans on
+            # the rigid MuJoCo joint stops (right ankle roll pinned at its limit, knees
+            # locked in hyperextension); joint_limit only sees the tiny overshoot past the
+            # hard stop.
+            "joint_soft_limit": 0.0,
+            # joint_target_limit: linear penalty on the PD position target beyond the hard
+            # joint range. Once a joint rests on its stop, pushing the target further out
+            # leaves joint_soft_limit flat (zero gradient); this term keeps a gradient
+            # until the target is back inside the range.
+            "joint_target_limit": 0.0,
         }
     )
     std_local_points: float = 0.1
     std_upper_body_joint_pos: float = 0.2
     # feet_slide / feet_yaw gate: a foot is penalized only while the *reference* foot is
-    # planted (reference and robot ankle_roll_link world-z below feet_contact_height, and
-    # reference foot horizontal speed below feet_ref_stance_speed). H2's swing foot stays
-    # low, so a robot-height-only gate counted ~20-40% swing frames and would punish
-    # stepping. Reference stance z is ~0.05 m (p95 0.077) on the H2 walking clips.
+    # planted (reference ankle_roll_link world-z below feet_contact_height and reference foot
+    # horizontal speed below feet_ref_stance_speed), whatever the robot foot does: a robot
+    # foot stepping during reference stance is exactly what these terms must catch. H2's
+    # swing foot stays low, so a robot-height-only gate counted ~20-40% swing frames and
+    # would punish stepping. Reference stance z is ~0.05 m (p95 0.077) on the H2 walking clips.
     feet_contact_height: float = 0.08
     feet_ref_stance_speed: float = 0.1
     # Angular-speed / joint-speed deadzone (rad/s) for anti_shake_ang_vel. No penalty
     # below this, so intentional wrist/head motion is free; only jitter is punished.
     anti_shake_threshold: float = 1.5
+    # Fraction of each joint range, centred, that joint_soft_limit leaves unpenalized.
+    soft_joint_limit_factor: float = 0.95
 
 
 @registry.envcfg("H2SonicMotionTracking")
@@ -200,6 +218,14 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
 
     def __init__(self, cfg: H2SonicMotionTrackingCfg, num_envs: int = 1, backend_type: str = "mujoco"):
         super().__init__(cfg, num_envs=num_envs, backend_type=backend_type)
+        # joint_soft_limit bounds: the centred soft_joint_limit_factor of each joint range.
+        if self._joint_lower is not None and self._joint_upper is not None:
+            mid = 0.5 * (self._joint_lower + self._joint_upper)
+            half = 0.5 * cfg.reward_config.soft_joint_limit_factor * (
+                self._joint_upper - self._joint_lower
+            )
+            self._soft_joint_lower = (mid - half).astype(self._joint_lower.dtype)
+            self._soft_joint_upper = (mid + half).astype(self._joint_upper.dtype)
         self._strict_local_point_indices = np.asarray(
             [cfg.body_names.index(name) for name in cfg.strict_local_point_body_names], dtype=np.intp
         )
@@ -531,6 +557,36 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
         self._reward_fns["anti_shake_ang_vel"] = self._reward_anti_shake_ang_vel
         self._reward_fns["target_rate_l2"] = self._reward_target_rate_l2
         self._reward_fns["upper_body_joint_pos"] = self._reward_upper_body_joint_pos
+        self._reward_fns["joint_soft_limit"] = self._reward_joint_soft_limit
+        self._reward_fns["joint_target_limit"] = self._reward_joint_target_limit
+
+    def _reward_term_is_active(self, name: str) -> bool:
+        if name in ("joint_soft_limit", "joint_target_limit"):
+            return self._joint_lower is not None and self._joint_upper is not None
+        return super()._reward_term_is_active(name)
+
+    def _reward_joint_soft_limit(self, ctx: Any) -> np.ndarray:
+        """Summed joint-position excess (rad) beyond the centred soft range."""
+        np.subtract(self._soft_joint_lower, ctx.dof_pos, out=ctx.joint_error)
+        np.maximum(ctx.joint_error, 0.0, out=ctx.joint_error)
+        np.subtract(ctx.dof_pos, self._soft_joint_upper, out=ctx.joint_error_upper)
+        np.maximum(ctx.joint_error_upper, 0.0, out=ctx.joint_error_upper)
+        ctx.joint_error += ctx.joint_error_upper
+        np.sum(ctx.joint_error, axis=1, out=ctx.reward_term)
+        return ctx.reward_term
+
+    def _reward_joint_target_limit(self, ctx: Any) -> np.ndarray:
+        """Summed PD-target excess (rad) beyond the hard joint range."""
+        target = ctx.joint_error_upper
+        np.multiply(ctx.info["current_actions"], self._cfg.control_config.action_scale, out=target)
+        target += self._effective_default_angles()
+        np.subtract(self._joint_lower, target, out=ctx.joint_error)
+        np.maximum(ctx.joint_error, 0.0, out=ctx.joint_error)
+        target -= self._joint_upper
+        np.maximum(target, 0.0, out=target)
+        ctx.joint_error += target
+        np.sum(ctx.joint_error, axis=1, out=ctx.reward_term)
+        return ctx.reward_term
 
     def _reward_target_rate_l2(self, ctx: Any) -> np.ndarray:
         """Squared change in physical PD position targets, in radian units."""
@@ -645,11 +701,11 @@ class H2SonicMotionTrackingEnv(MotionTrackingEnv):
 
     def _foot_stance_gate(self, ctx: Any) -> None:
         """Write the reference-stance gate into ``self._foot_gate`` (zero-alloc)."""
+        # Reference only: a robot-height condition would let the policy dodge the penalty
+        # by lifting the foot above feet_contact_height while the reference stands.
         idx = self._strict_foot_indices
         rc = self._cfg.reward_config
-        np.less(ctx.robot_body_pos_w[:, idx, 2], rc.feet_contact_height, out=self._foot_gate)
-        np.less(ctx.motion_data.body_pos_w[:, idx, 2], rc.feet_contact_height, out=self._foot_gate_tmp)
-        self._foot_gate &= self._foot_gate_tmp
+        np.less(ctx.motion_data.body_pos_w[:, idx, 2], rc.feet_contact_height, out=self._foot_gate)
         np.square(ctx.motion_data.body_lin_vel_w[:, idx, :2], out=self._foot_xy_sq)
         np.sum(self._foot_xy_sq, axis=2, out=self._foot_ref_speed_sq)
         np.less(self._foot_ref_speed_sq, rc.feet_ref_stance_speed**2, out=self._foot_gate_tmp)

@@ -89,6 +89,13 @@ reward:
     joint_acc_l2: -2.5e-7
     joint_torque_l2: -1.0e-6
     anti_shake_ang_vel: -5.0e-3
+    # Soft joint-limit penalty (enabled per stage by the launcher): linear excess beyond the
+    # centred soft_joint_limit_factor of each joint range, so the policy stops leaning on
+    # the rigid joint stops (ankle roll / knee hyperextension). Default 0.0 = OFF.
+    joint_soft_limit: 0.0
+    # PD-target-beyond-hard-range penalty: keeps a gradient while a joint
+    # rests on its stop, where joint_soft_limit is flat. Default 0.0 = OFF.
+    joint_target_limit: 0.0
   std_root_pos: 0.3
   std_root_ori: 0.4
   std_body_pos: 0.3
@@ -97,6 +104,7 @@ reward:
   std_body_ang_vel: 3.14
   std_joint_pos: 0.2
   std_upper_body_joint_pos: 0.2
+  soft_joint_limit_factor: 0.95
   std_joint_vel: 1.0
 play_profile:
   enabled: true

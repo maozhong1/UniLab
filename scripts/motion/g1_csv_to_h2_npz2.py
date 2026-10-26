@@ -39,6 +39,8 @@ Usage:
     uv run scripts/motion/g1_csv_to_h2_npz2.py --input clip.csv --output out.npz --debug
     uv run scripts/motion/g1_csv_to_h2_npz2.py --input <dir> --output <dir> --limit 20
     uv run scripts/motion/g1_csv_to_h2_npz2.py --input <dir> --output <dir> --workers 10
+    uv run scripts/motion/g1_csv_to_h2_npz2.py --input <dir> --output <dir> \
+        --align_sole_center --foot_forward_extra 0.025   # standing CoM near mid-foot
 """
 
 from __future__ import annotations
@@ -123,6 +125,13 @@ _ORI_H2_BODY: dict[str, str] = {
     "right_ankle_roll_link": "right_ankle_pitch_link",
 }
 _ORI_H2_BODY_LEGACY: dict[str, str] = {name: name for name in _ORI_WEIGHTS}
+# Distal foot body (the one carrying the sole contact geoms) per robot, keyed by the tracked
+# foot (IK position body). Used only by --align_sole_center to locate each sole centre.
+_G1_SOLE_BODY: dict[str, str] = {name: name for name in _FOOT_BODIES}
+_H2_SOLE_BODY: dict[str, str] = {
+    "left_ankle_roll_link": "left_ankle_pitch_link",
+    "right_ankle_roll_link": "right_ankle_pitch_link",
+}
 
 
 _SENSOR_PREFIXES = ("track_pos_w_", "track_quat_w_", "track_linvel_w_", "track_angvel_w_")
@@ -211,6 +220,47 @@ def _standing_geometry(model_file: str) -> tuple[float, float, float, float]:
     return pelvis_z, hip_to_foot, foot_z, arm_len
 
 
+def _sole_center_x(model_file: str, sole_bodies: dict[str, str]) -> float:
+    """Fore-aft sole-centre offset (m) of the foot contact geoms from the tracked ankle origin.
+
+    Cold path only (startup). The IK position target is the ``ankle_roll_link`` body *origin*,
+    but the sole sits differently around that origin on G1 vs H2 (H2's sole is shifted back),
+    so matching origins leaves the H2 CoM near the toes. For each foot we take every contact
+    geom (``contype != 0``) on the distal foot body, project its fore-aft extent (sphere/capsule
+    radius included) into the distal-foot frame, and return the midpoint of the [heel, toe]
+    range relative to the tracked ankle origin, averaged over both feet. Measured at qpos0.
+    """
+    model = mujoco.MjModel.from_xml_path(model_file)
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    centers: list[float] = []
+    for foot, sole in sole_bodies.items():
+        ids = _body_ids(model, (foot, sole))
+        rot = data.xmat[ids[sole]].reshape(3, 3)  # distal-foot frame (x = forward)
+        xs: list[float] = []
+        for g in range(model.ngeom):
+            if model.geom_bodyid[g] != ids[sole] or model.geom_contype[g] == 0:
+                continue
+            gtype = model.geom_type[g]
+            size = model.geom_size[g]
+            gx = float((data.geom_xpos[g] - data.xpos[ids[foot]]) @ rot[:, 0])
+            if gtype == mujoco.mjtGeom.mjGEOM_SPHERE:
+                half = float(size[0])
+            elif gtype == mujoco.mjtGeom.mjGEOM_CAPSULE:
+                axis_x = float(data.geom_xmat[g].reshape(3, 3)[:, 2] @ rot[:, 0])
+                half = abs(axis_x) * float(size[1]) + float(size[0])
+            elif gtype == mujoco.mjtGeom.mjGEOM_BOX:
+                gmat = data.geom_xmat[g].reshape(3, 3)
+                half = float(np.abs(gmat.T @ rot[:, 0]) @ size[:3])
+            else:
+                raise ValueError(f"unsupported foot contact geom type {gtype} on '{sole}'")
+            xs.extend((gx - half, gx + half))
+        if not xs:
+            raise ValueError(f"no foot contact geoms (contype!=0) on '{sole}' in {model_file}")
+        centers.append(0.5 * (min(xs) + max(xs)))
+    return float(np.mean(centers))
+
+
 def _quat_error_world(q_target: np.ndarray, q_current: np.ndarray) -> np.ndarray:
     """World-frame rotation vector omega s.t. applying omega rotates q_current onto q_target.
 
@@ -259,6 +309,7 @@ def _build_targets(
     v_scale: float,
     foot_offset: float,
     arm_scale: float,
+    foot_forward: float = 0.0,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     """Scale G1 body world poses into contact-preserving H2 targets.
 
@@ -269,6 +320,11 @@ def _build_targets(
     Distal arm bodies (elbow, wrist) are then overwritten with a shoulder-anchored offset
     scaled by ``arm_scale`` (H2's arm-length ratio) so hand reach follows H2's arm proportions
     instead of the leg ratio. Orientation is copied unchanged (scale-free).
+    ``foot_forward`` (m, 0 = off) then slides both foot position targets forward along the
+    feet's shared horizontal heading (mean yaw of the two foot orientation targets) so H2's
+    sole centre — not its ankle origin — lands near the scaled G1 sole centre (see
+    ``--align_sole_center``). Using one shared direction (not each foot's own, toed-out yaw)
+    keeps stance width and the left-right foot offset unchanged.
     """
     support_z = min(g1_pos[f][2] for f in _FOOT_BODIES)  # world Z of the planted foot
     pelvis_xy = g1_pos[_ANCHOR_BODY][:2]
@@ -287,6 +343,19 @@ def _build_targets(
     for name, shoulder in _ARM_SHOULDER.items():
         tgt_pos[name] = tgt_pos[shoulder] + (g1_pos[name] - g1_pos[shoulder]) * arm_scale
     tgt_quat = {name: g1_quat[name].copy() for name in _ORI_WEIGHTS}
+    if foot_forward != 0.0:
+        rot = np.empty(9)
+        heading = np.zeros(2)
+        for name in _FOOT_BODIES:
+            mujoco.mju_quat2Mat(rot, tgt_quat[name])
+            foot_dir = rot.reshape(3, 3)[:2, 0]  # foot x-axis, horizontal (yaw) component only
+            norm = float(np.linalg.norm(foot_dir))
+            if norm > 1e-6:
+                heading += foot_dir / norm
+        norm = float(np.linalg.norm(heading))
+        if norm > 1e-6:  # feet facing opposite ways -> no well-defined forward, leave as-is
+            for name in _FOOT_BODIES:
+                tgt_pos[name][:2] += foot_forward * heading / norm
     return tgt_pos, tgt_quat
 
 
@@ -408,6 +477,7 @@ def run_h2_ik_export(
     ground_tol: float = 0.0,
     ground_smooth: int = 5,
     legacy_foot_ori: bool = False,
+    foot_forward: float = 0.0,
     progress: bool = True,
 ) -> dict[str, float]:
     tmp_model_path, _, _ = inject_mujoco_tracking_sensors(h2_model_file)
@@ -448,7 +518,9 @@ def run_h2_ik_export(
         g1_pos, g1_quat = source.poses(
             loader.motion_base_poss[i], loader.motion_base_rots[i], loader.motion_dof_poss[i]
         )
-        tgt_pos, tgt_quat = _build_targets(g1_pos, g1_quat, h_scale, v_scale, foot_offset, arm_scale)
+        tgt_pos, tgt_quat = _build_targets(
+            g1_pos, g1_quat, h_scale, v_scale, foot_offset, arm_scale, foot_forward
+        )
         # naive G1-name copy = posture bias for redundant DoFs (0 for H2-only head joints)
         bias = np.zeros(num_joints)
         for j, (qa, _va) in enumerate(inj):
@@ -599,6 +671,11 @@ def parse_args() -> argparse.Namespace:
                    help="temporal window (frames) to smooth the grounding lift (1=off, per-frame)")
     p.add_argument("--legacy_foot_ori", action="store_true",
                    help="match foot orientation on H2 ankle_roll_link (old, incorrect behaviour)")
+    p.add_argument("--align_sole_center", action="store_true",
+                   help="shift H2 foot targets forward so H2's sole centre (not its ankle origin) "
+                        "matches the scaled G1 sole centre (puts the standing CoM nearer mid-foot)")
+    p.add_argument("--foot_forward_extra", type=float, default=0.0,
+                   help="extra forward foot-target shift (m) on top of --align_sole_center")
     p.add_argument("--workers", type=int, default=1,
                    help="parallel worker processes, one clip per task (1=serial)")
     p.add_argument("--limit", type=int, default=0, help="convert only the first N clips (0=all)")
@@ -625,6 +702,16 @@ def main() -> None:
     v_scale = args.v_scale or (h2_pelvis / g1_pelvis)
     arm_scale = args.arm_scale or (h2_arm / g1_arm)
     foot_offset = h2_foot  # H2 nominal ankle-origin height -> grounded feet land naturally
+    # Optional fore-aft sole alignment: delta = c_g1 * h_scale - c_h2 + extra (cold path).
+    foot_forward = 0.0
+    if args.align_sole_center:
+        c_g1 = _sole_center_x(args.g1_model_xml, _G1_SOLE_BODY)
+        c_h2 = _sole_center_x(args.h2_model_xml, _H2_SOLE_BODY)
+        foot_forward = c_g1 * h_scale - c_h2 + args.foot_forward_extra
+        print(f"[g1_csv_to_h2_npz2] sole centre: G1 {c_g1:+.4f} m, H2 {c_h2:+.4f} m -> "
+              f"foot_forward={foot_forward:+.4f} m (extra {args.foot_forward_extra:+.4f})")
+    elif args.foot_forward_extra:
+        raise SystemExit("--foot_forward_extra requires --align_sole_center")
 
     print(f"[g1_csv_to_h2_npz2] {len(csv_files)} clip(s); G1={args.g1_model_xml}  H2={args.h2_model_xml}")
     print(f"[g1_csv_to_h2_npz2] input_fps={args.input_fps:g} output_fps={args.output_fps:g}")
@@ -642,7 +729,7 @@ def main() -> None:
         damping=args.damping, posture_w=args.posture_w, iters=args.ik_iters,
         warm_iters=args.warm_iters, debug=args.debug, ground=not args.no_ground,
         ground_tol=args.ground_tol, ground_smooth=args.ground_smooth,
-        legacy_foot_ori=args.legacy_foot_ori,
+        legacy_foot_ori=args.legacy_foot_ori, foot_forward=foot_forward,
     )
     loader_kwargs = dict(
         input_fps=int(args.input_fps), output_fps=int(args.output_fps),
