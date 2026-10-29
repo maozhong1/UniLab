@@ -6,6 +6,7 @@ set -euo pipefail
 # checkpoint unless CHECKPOINT is set. Stages 2.5 and 2.8 merge manipulation clips
 # into the base dataset before filtering. Set NPZ_DIR to bypass filtering.
 # DR_STAGE=A|B adds sim2real domain randomization (A: light, no push; B: full + push + armature).
+# CRITIC_WARMUP=N freezes the actor for the first N iterations of this run (default 30 with DR).
 
 UNILAB="${UNILAB:-/home/maozhong/work/my_sonic/UniLab}"
 SOURCE_NPZ_DIR="${SOURCE_NPZ_DIR:-$HOME/work/sonic_vla_infer/bones_seed_3k_new/npz_gr2_27dof}"
@@ -116,6 +117,25 @@ case "$DR_STAGE" in
     exit 2
     ;;
 esac
+if [[ "$DR_STAGE" == "none" ]]; then
+  CRITIC_WARMUP="${CRITIC_WARMUP:-0}"
+else
+  CRITIC_WARMUP="${CRITIC_WARMUP:-30}"
+fi
+if [[ ! "$CRITIC_WARMUP" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: CRITIC_WARMUP must be a non-negative integer" >&2
+  exit 2
+fi
+
+if [[ "$DR_STAGE" != "none" ]]; then
+  # Reset-time model DR clones the mjModel per env; the light physics scene keeps that
+  # affordable at 4096 envs (see scripts/sonic/build_gr2_physics_scene.py).
+  GR2_ASSET_DIR="$UNILAB/src/unilab/assets/robots/gr2"
+  DR_ARGS+=(
+    "++env.scene.model_file=$GR2_ASSET_DIR/scene_sonic_27dof_physics.xml"
+    "++env.scene.visual_model_file=$GR2_ASSET_DIR/scene_sonic_27dof.xml"
+  )
+fi
 
 if [[ ! "$FOCUS_REPEAT" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: FOCUS_REPEAT must be a positive integer" >&2
@@ -314,6 +334,7 @@ TRAIN_ARGS=(
   "algo.algorithm.entropy_coef=$ENTROPY_COEF"
   algo.algorithm.desired_kl=0.01
   "algo.algorithm.adaptive_lr_max=$ADAPTIVE_LR_MAX"
+  "algo.algorithm.critic_warmup_iters=$CRITIC_WARMUP"
   "algo.num_steps_per_env=$NUM_STEPS"
   "reward.scales.motion_global_root_pos=$ROOT_POS_SCALE"
   "reward.scales.action_rate_l2=$ACTION_RATE_L2_SCALE"
@@ -337,7 +358,7 @@ TRAIN_ARGS=(
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   uv run --no-sync python scripts/train_rsl_rl.py "${TRAIN_ARGS[@]}" --cfg job >/dev/null
-  echo "Hydra compose passed (stage=$CURRICULUM_STAGE, motion_entries=${#NPZ_FILES[@]}, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD, dr_stage=$DR_STAGE)"
+  echo "Hydra compose passed (stage=$CURRICULUM_STAGE, motion_entries=${#NPZ_FILES[@]}, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD, dr_stage=$DR_STAGE, critic_warmup=$CRITIC_WARMUP)"
   exit 0
 fi
 
@@ -345,4 +366,4 @@ LOG="$WORK_DIR/full_train_gr2_stage${CURRICULUM_STAGE}_$(date +%Y%m%d_%H%M%S).lo
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 setsid nohup uv run --no-sync python scripts/train_rsl_rl.py "${TRAIN_ARGS[@]}" \
   > "$LOG" 2>&1 < /dev/null &
-echo "launched GR2 stage $CURRICULUM_STAGE (${#NPZ_FILES[@]} motion entries, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD, dr_stage=$DR_STAGE), log=$LOG"
+echo "launched GR2 stage $CURRICULUM_STAGE (${#NPZ_FILES[@]} motion entries, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD, dr_stage=$DR_STAGE, critic_warmup=$CRITIC_WARMUP), log=$LOG"

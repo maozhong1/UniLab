@@ -312,3 +312,41 @@ def test_gr2_sonic_joint_armature_randomization_skips_floating_base() -> None:
     env.reset(np.arange(1, dtype=np.int32))
     state = env.step(np.zeros((1, 27), dtype=np.float32))
     assert all(np.isfinite(value).all() for value in state.obs.values())
+
+
+def test_gr2_sonic_physics_scene_matches_full_scene_dynamics_contract() -> None:
+    full = mujoco.MjModel.from_xml_path(str(_ASSET_DIR / "scene_sonic_27dof.xml"))
+    light = mujoco.MjModel.from_xml_path(str(_ASSET_DIR / "scene_sonic_27dof_physics.xml"))
+
+    assert (light.nq, light.nv, light.nu, light.nbody, light.nsensor) == (
+        full.nq, full.nv, full.nu, full.nbody, full.nsensor,
+    )
+    for field in (
+        "body_mass", "body_inertia", "body_ipos", "body_iquat", "body_pos", "body_quat",
+        "jnt_range", "dof_armature", "dof_damping", "dof_frictionloss",
+        "actuator_gainprm", "actuator_biasprm", "actuator_forcerange", "sensor_type",
+        "key_qpos", "key_ctrl",
+    ):
+        np.testing.assert_allclose(getattr(light, field), getattr(full, field), err_msg=field)
+    assert (light.opt.cone, light.opt.solver) == (full.opt.cone, full.opt.solver)
+
+    def collision_geoms(model: mujoco.MjModel) -> list[tuple]:
+        return [
+            (
+                int(model.geom_bodyid[i]), int(model.geom_type[i]),
+                int(model.geom_contype[i]), int(model.geom_conaffinity[i]),
+                int(model.geom_condim[i]), int(model.geom_priority[i]),
+                *np.round(model.geom_friction[i], 6), *np.round(model.geom_solref[i], 6),
+            )
+            for i in range(model.ngeom)
+            if model.geom_contype[i] or model.geom_conaffinity[i]
+        ]
+
+    assert collision_geoms(light) == collision_geoms(full)
+    for name in ("floor", "l_foot_sole", "r_foot_sole"):
+        full_id = mujoco.mj_name2id(full, mujoco.mjtObj.mjOBJ_GEOM, name)
+        light_id = mujoco.mj_name2id(light, mujoco.mjtObj.mjOBJ_GEOM, name)
+        np.testing.assert_allclose(light.geom_size[light_id], full.geom_size[full_id])
+        np.testing.assert_allclose(light.geom_pos[light_id], full.geom_pos[full_id])
+    assert light.ntex == 0
+    assert light.nmeshface < full.nmeshface // 20
