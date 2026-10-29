@@ -77,6 +77,10 @@ class DomainRand:
     randomize_joint_default_pos: bool = False
     joint_default_pos_range: list[float] = field(default_factory=lambda: [-0.01, 0.01])
 
+    # Per-joint armature scale on actuated DoFs only (the floating base is untouched).
+    randomize_joint_armature: bool = False
+    joint_armature_multiplier_range: list[float] = field(default_factory=lambda: [0.8, 1.2])
+
 
 # Backward-compatible alias for the historical (snake_case) class name.
 Domain_Rand = DomainRand

@@ -18,7 +18,9 @@
 
   <worldbody>
     <light pos="1 0 3.5" dir="0 0 -1" directional="true"/>
-    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+    <!-- MuJoCo takes the max sliding friction of a contact pair; a low floor value lets
+         the sole friction (nominal 1.0) own the contact so foot-friction DR below 1.0 applies. -->
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" friction="0.1 0.005 0.0001"/>
   </worldbody>
 
   <keyframe>

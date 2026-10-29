@@ -200,3 +200,115 @@ def test_gr2_sonic_env_reset_and_step_shapes_are_finite() -> None:
         "diagnostic/estimated_torque_saturation_ratio",
         "diagnostic/estimated_upper_body_torque_saturation_ratio",
     } <= state.info["log"].keys()
+
+
+def _sole_floor_contact_friction(model: mujoco.MjModel, data: mujoco.MjData) -> list[float]:
+    floor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+    sole_ids = {
+        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"{side}_foot_sole") for side in "lr"
+    }
+    return [
+        float(contact.friction[0])
+        for contact in data.contact[: data.ncon]
+        if {int(contact.geom1), int(contact.geom2)} & sole_ids
+        and floor_id in (contact.geom1, contact.geom2)
+    ]
+
+
+def test_gr2_sonic_sole_friction_owns_floor_contact() -> None:
+    model = mujoco.MjModel.from_xml_path(str(_ASSET_DIR / "scene_sonic_27dof.xml"))
+    data = mujoco.MjData(model)
+    mujoco.mj_resetDataKeyframe(model, data, 0)
+    data.qpos[2] = 0.92
+    for _ in range(200):
+        mujoco.mj_step(model, data)
+        if _sole_floor_contact_friction(model, data):
+            break
+
+    nominal = _sole_floor_contact_friction(model, data)
+    assert nominal
+    np.testing.assert_allclose(nominal, 1.0)
+
+    for side in "lr":
+        sole_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"{side}_foot_sole")
+        model.geom_friction[sole_id, 0] = 0.3
+    mujoco.mj_forward(model, data)
+    np.testing.assert_allclose(_sole_floor_contact_friction(model, data), 0.3)
+
+
+def _reset_obs(cfg: GR2SonicMotionTrackingCfg) -> dict[str, np.ndarray]:
+    env = GR2SonicMotionTrackingEnv(cfg, num_envs=1, backend_type="mujoco")
+    np.random.seed(0)
+    obs, _ = env.reset(np.array([0], dtype=np.int32))
+    return obs
+
+
+def test_gr2_sonic_actor_noise_is_bounded_and_critic_stays_clean() -> None:
+    clean = _reset_obs(GR2SonicMotionTrackingCfg(critic_privileged_mf_hist=True))
+    noisy_cfg = GR2SonicMotionTrackingCfg(critic_privileged_mf_hist=True)
+    noisy_cfg.noise_config.level = 0.5
+    noisy_cfg.noise_config.seed = 0
+    noisy = _reset_obs(noisy_cfg)
+
+    np.testing.assert_array_equal(noisy["critic"], clean["critic"])
+    np.testing.assert_array_equal(noisy["obs"][:, :600], clean["obs"][:, :600])
+
+    n, history = 27, noisy_cfg.proprio_history_len
+    noise = noisy_cfg.noise_config
+    diff = (noisy["obs"] - clean["obs"])[0, 600:]
+    offset = 0
+    for width, scale in (
+        (3, noise.scale_gyro),
+        (n, noise.scale_joint_angle),
+        (n, noise.scale_joint_vel),
+        (n, 0.0),
+        (3, noise.scale_gravity),
+    ):
+        term = diff[offset : offset + width * history]
+        offset += width * history
+        assert np.all(np.abs(term) <= 0.5 * scale + 1e-6)
+        if scale > 0.0:
+            assert np.any(term != 0.0)
+    assert offset == diff.size
+
+
+def test_gr2_sonic_foot_friction_randomization_matches_soles() -> None:
+    cfg = GR2SonicMotionTrackingCfg(critic_privileged_mf_hist=True)
+    cfg.domain_rand.randomize_geom_friction = True
+    cfg.domain_rand.friction_range = [0.3, 0.3]
+    env = GR2SonicMotionTrackingEnv(cfg, num_envs=1, backend_type="mujoco")
+    assert env._dr_manager is not None
+    plan = env._dr_manager._provider.build_reset_plan(env, np.array([0], dtype=np.int32))
+
+    assert plan.randomization is not None
+    friction = plan.randomization.geom_friction
+    base = env._backend.get_geom_friction()
+    names = env._backend.get_geom_names()
+    sole_ids = [names.index(f"{side}_foot_sole") for side in "lr"]
+    np.testing.assert_allclose(friction[0, sole_ids, 0], 0.3)
+    other = np.ones(len(names), dtype=bool)
+    other[sole_ids] = False
+    np.testing.assert_array_equal(friction[0, other], base[other])
+
+
+def test_gr2_sonic_joint_armature_randomization_skips_floating_base() -> None:
+    cfg = GR2SonicMotionTrackingCfg(critic_privileged_mf_hist=True)
+    cfg.domain_rand.randomize_joint_armature = True
+    cfg.domain_rand.joint_armature_multiplier_range = [0.8, 1.2]
+    env = GR2SonicMotionTrackingEnv(cfg, num_envs=1, backend_type="mujoco")
+    assert env._dr_manager is not None
+    np.random.seed(0)
+    plan = env._dr_manager._provider.build_reset_plan(env, np.arange(1, dtype=np.int32))
+
+    assert plan.randomization is not None
+    armature = plan.randomization.dof_armature[0]
+    base = env._backend.get_dof_armature()
+    assert base.size == 6 + 27
+    np.testing.assert_array_equal(armature[:6], base[:6])
+    ratio = armature[6:] / base[6:]
+    assert np.all((ratio >= 0.8) & (ratio <= 1.2))
+    assert np.unique(ratio).size > 1
+
+    env.reset(np.arange(1, dtype=np.int32))
+    state = env.step(np.zeros((1, 27), dtype=np.float32))
+    assert all(np.isfinite(value).all() for value in state.obs.values())

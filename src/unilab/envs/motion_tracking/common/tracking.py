@@ -100,11 +100,21 @@ class MotionTrackingEnv(G1BaseEnv):
                     "friction_geom_pattern "
                     f"'{cfg.domain_rand.friction_geom_pattern}' did not match any geom"
                 )
+        base_dof_armature = None
+        joint_dof_ids = None
+        if cfg.domain_rand.randomize_joint_armature:
+            base_dof_armature = backend.get_dof_armature()
+            # Actuated joints are the DoFs after the floating base (same layout as dof_vel).
+            joint_dof_ids = np.arange(
+                base_dof_armature.size - self._num_action, base_dof_armature.size, dtype=np.int64
+            )
         dr_provider = MotionTrackingDomainRandomizationProvider(
             base_kp=base_kp,
             base_kd=base_kd,
             base_geom_friction=base_geom_friction,
             foot_geom_ids=foot_geom_ids,
+            base_dof_armature=base_dof_armature,
+            joint_dof_ids=joint_dof_ids,
         )
         self._init_domain_randomization(dr_provider)
 

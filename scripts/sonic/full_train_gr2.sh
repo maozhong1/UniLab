@@ -5,6 +5,7 @@ set -euo pipefail
 # Stage 1 starts from scratch. Later stages require LOAD_RUN and resume its newest
 # checkpoint unless CHECKPOINT is set. Stages 2.5 and 2.8 merge manipulation clips
 # into the base dataset before filtering. Set NPZ_DIR to bypass filtering.
+# DR_STAGE=A|B adds sim2real domain randomization (A: light, no push; B: full + push + armature).
 
 UNILAB="${UNILAB:-/home/maozhong/work/my_sonic/UniLab}"
 SOURCE_NPZ_DIR="${SOURCE_NPZ_DIR:-$HOME/work/sonic_vla_infer/bones_seed_3k_new/npz_gr2_27dof}"
@@ -74,6 +75,47 @@ fi
 STRICT_FOOT_POS_THRESHOLD="${STRICT_FOOT_POS_THRESHOLD:-$DEFAULT_STRICT_FOOT_POS_THRESHOLD}"
 STRICT_ANCHOR_ORI_ERROR_SQ="${STRICT_ANCHOR_ORI_ERROR_SQ:-$DEFAULT_STRICT_ANCHOR_ORI_ERROR_SQ}"
 STRICT_HEIGHT_THRESHOLD="${STRICT_HEIGHT_THRESHOLD:-$DEFAULT_STRICT_HEIGHT_THRESHOLD}"
+
+DR_STAGE="${DR_STAGE:-none}"
+case "$DR_STAGE" in
+  none)
+    DR_ARGS=()
+    ;;
+  A)
+    DR_ARGS=(
+      ++env.domain_rand.randomize_geom_friction=true "++env.domain_rand.friction_range=[0.4,1.2]"
+      ++env.domain_rand.randomize_base_mass=true "++env.domain_rand.added_mass_range=[-1.0,2.0]"
+      ++env.domain_rand.random_com=true "++env.domain_rand.com_offset_x=[-0.02,0.02]"
+      "++env.domain_rand.com_offset_y=[-0.03,0.03]" "++env.domain_rand.com_offset_z=[-0.03,0.03]"
+      ++env.domain_rand.randomize_kp=true "++env.domain_rand.kp_multiplier_range=[0.9,1.1]"
+      ++env.domain_rand.randomize_kd=true "++env.domain_rand.kd_multiplier_range=[0.9,1.1]"
+      ++env.domain_rand.randomize_joint_default_pos=true
+      "++env.domain_rand.joint_default_pos_range=[-0.01,0.01]"
+      ++env.noise_config.level=0.5
+    )
+    ;;
+  B)
+    DR_ARGS=(
+      ++env.domain_rand.randomize_geom_friction=true "++env.domain_rand.friction_range=[0.3,1.6]"
+      ++env.domain_rand.randomize_base_mass=true "++env.domain_rand.added_mass_range=[-1.5,3.0]"
+      ++env.domain_rand.random_com=true "++env.domain_rand.com_offset_x=[-0.025,0.025]"
+      "++env.domain_rand.com_offset_y=[-0.05,0.05]" "++env.domain_rand.com_offset_z=[-0.05,0.05]"
+      ++env.domain_rand.randomize_kp=true "++env.domain_rand.kp_multiplier_range=[0.85,1.15]"
+      ++env.domain_rand.randomize_kd=true "++env.domain_rand.kd_multiplier_range=[0.85,1.15]"
+      ++env.domain_rand.randomize_joint_default_pos=true
+      "++env.domain_rand.joint_default_pos_range=[-0.02,0.02]"
+      ++env.domain_rand.randomize_joint_armature=true
+      "++env.domain_rand.joint_armature_multiplier_range=[0.8,1.2]"
+      ++env.noise_config.level=1.0
+      ++env.domain_rand.push_robots=true ++env.domain_rand.push_interval=250
+      "++env.domain_rand.max_force=[${PUSH_FORCE_XY:-600},${PUSH_FORCE_XY:-600},${PUSH_FORCE_Z:-150}]"
+    )
+    ;;
+  *)
+    echo "ERROR: DR_STAGE must be none, A, or B" >&2
+    exit 2
+    ;;
+esac
 
 if [[ ! "$FOCUS_REPEAT" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: FOCUS_REPEAT must be a positive integer" >&2
@@ -290,11 +332,12 @@ TRAIN_ARGS=(
   "algo.num_envs=$NUM_ENVS"
   "algo.max_iterations=$MAX_ITERATIONS"
   "algo.save_interval=$SAVE_INTERVAL"
+  "${DR_ARGS[@]}"
 )
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   uv run --no-sync python scripts/train_rsl_rl.py "${TRAIN_ARGS[@]}" --cfg job >/dev/null
-  echo "Hydra compose passed (stage=$CURRICULUM_STAGE, motion_entries=${#NPZ_FILES[@]}, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD)"
+  echo "Hydra compose passed (stage=$CURRICULUM_STAGE, motion_entries=${#NPZ_FILES[@]}, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD, dr_stage=$DR_STAGE)"
   exit 0
 fi
 
@@ -302,4 +345,4 @@ LOG="$WORK_DIR/full_train_gr2_stage${CURRICULUM_STAGE}_$(date +%Y%m%d_%H%M%S).lo
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 setsid nohup uv run --no-sync python scripts/train_rsl_rl.py "${TRAIN_ARGS[@]}" \
   > "$LOG" 2>&1 < /dev/null &
-echo "launched GR2 stage $CURRICULUM_STAGE (${#NPZ_FILES[@]} motion entries, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD), log=$LOG"
+echo "launched GR2 stage $CURRICULUM_STAGE (${#NPZ_FILES[@]} motion entries, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD, dr_stage=$DR_STAGE), log=$LOG"

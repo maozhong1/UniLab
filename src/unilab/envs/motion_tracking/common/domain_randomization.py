@@ -20,7 +20,11 @@ from unilab.dr.dr_utils import (
     validate_interval_push_support,
     zero_actions,
 )
-from unilab.dr.types import RESET_TERM_GEOM_FRICTION, ResetRandomizationPayload
+from unilab.dr.types import (
+    RESET_TERM_DOF_ARMATURE,
+    RESET_TERM_GEOM_FRICTION,
+    ResetRandomizationPayload,
+)
 from unilab.dtype_config import get_global_dtype
 
 from .reset import build_motion_reference_state
@@ -34,11 +38,15 @@ class MotionTrackingDomainRandomizationProvider(DomainRandomizationProvider):
         base_kd: np.ndarray | None = None,
         base_geom_friction: np.ndarray | None = None,
         foot_geom_ids: np.ndarray | None = None,
+        base_dof_armature: np.ndarray | None = None,
+        joint_dof_ids: np.ndarray | None = None,
     ) -> None:
         self._base_kp = base_kp
         self._base_kd = base_kd
         self._base_geom_friction = base_geom_friction
         self._foot_geom_ids = foot_geom_ids
+        self._base_dof_armature = base_dof_armature
+        self._joint_dof_ids = joint_dof_ids
         self._last_reset_observation_timing_ms: dict[str, float] = {}
 
     @property
@@ -62,6 +70,14 @@ class MotionTrackingDomainRandomizationProvider(DomainRandomizationProvider):
                 or self._foot_geom_ids.size == 0
             ):
                 raise ValueError("randomize_geom_friction=True but provider has no foot geom IDs")
+        if getattr(env.cfg.domain_rand, "randomize_joint_armature", False):
+            if not capabilities.supports_reset_term(RESET_TERM_DOF_ARMATURE):
+                raise NotImplementedError(
+                    f"{env._backend.backend_type} backend does not support "
+                    "dof-armature reset randomization"
+                )
+            if self._base_dof_armature is None or self._joint_dof_ids is None:
+                raise ValueError("randomize_joint_armature=True but provider has no armature table")
 
     def build_interval_randomization_plan(
         self, env: Any, step_counter: int
@@ -97,6 +113,20 @@ class MotionTrackingDomainRandomizationProvider(DomainRandomizationProvider):
                 (1, self._foot_geom_ids.size)
             )
             payload.geom_friction = geom_friction
+            randomization = payload
+
+        if getattr(dr_cfg, "randomize_joint_armature", False):
+            assert self._base_dof_armature is not None
+            assert self._joint_dof_ids is not None
+            payload = randomization or ResetRandomizationPayload()
+            low, high = dr_cfg.joint_armature_multiplier_range
+            dof_armature = np.broadcast_to(
+                self._base_dof_armature, (num_reset, self._base_dof_armature.size)
+            ).copy()
+            dof_armature[:, self._joint_dof_ids] *= np.random.uniform(
+                low, high, size=(num_reset, self._joint_dof_ids.size)
+            )
+            payload.dof_armature = dof_armature
             randomization = payload
 
         if getattr(dr_cfg, "randomize_joint_default_pos", False):

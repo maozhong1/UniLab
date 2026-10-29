@@ -21,11 +21,11 @@ from unilab.assets import ASSETS_ROOT_PATH
 from unilab.base import registry
 from unilab.base.scene import SceneCfg
 from unilab.dtype_config import get_global_dtype
-from unilab.envs.locomotion.g1.base import Asset, ControlConfig, Sensor
+from unilab.envs.locomotion.g1.base import Asset, ControlConfig, NoiseConfig, Sensor
 from unilab.utils.geometry import np_write_relative_anchor_transform_pos_rot6d
 from unilab.utils.rotation import np_quat_apply_inverse
 
-from ..common.config import MotionTrackingCfg
+from ..common.config import DomainRand, MotionTrackingCfg
 from ..common.rewards import RewardConfig
 from ..common.tracking import MotionTrackingEnv
 
@@ -59,6 +59,21 @@ _CRITIC_BODY_NAMES: tuple[str, ...] = (
     "left_upper_arm_roll_link", "left_lower_arm_pitch_link", "left_hand_yaw_link",
     "right_upper_arm_roll_link", "right_lower_arm_pitch_link", "right_hand_yaw_link",
 )
+
+
+@dataclass
+class GR2NoiseConfig(NoiseConfig):
+    """Actor proprio noise amplitudes from the official SONIC policy observations."""
+
+    scale_joint_angle: float = 0.01
+    scale_joint_vel: float = 0.5
+    scale_gyro: float = 0.2
+    scale_gravity: float = 0.05
+
+
+@dataclass
+class GR2DomainRand(DomainRand):
+    friction_geom_pattern: str = r"^[lr]_foot_sole$"
 
 
 class GR2Asset(Asset):
@@ -151,6 +166,9 @@ class GR2SonicMotionTrackingCfg(MotionTrackingCfg):
         default_factory=lambda: ControlConfig(action_scale=_SONIC_ACTION_SCALE_MUJOCO.copy())
     )
     reward_config: SonicRewardConfig = field(default_factory=SonicRewardConfig)
+    # Noise is off by default (level=0); full_train_gr2.sh DR_STAGE raises the level.
+    noise_config: GR2NoiseConfig = field(default_factory=GR2NoiseConfig)
+    domain_rand: GR2DomainRand = field(default_factory=GR2DomainRand)
 
     anchor_pos_z_threshold: float = 0.75
     ee_body_pos_z_threshold: float = 0.75
@@ -369,12 +387,15 @@ class GR2SonicMotionTrackingEnv(MotionTrackingEnv):
         ).astype(dtype)
         dof_vel = np.asarray(dof_vel, dtype=dtype)
 
+        # Actor-only sensor noise, sampled before entering history; the critic history
+        # is built from clean signals in _build_sonic_critic.
+        noise = self._cfg.noise_config
         components = {
-            "gyro": np.asarray(gyro, dtype=dtype),
-            "joint_pos_rel": joint_pos_rel,
-            "dof_vel": dof_vel,
+            "gyro": self._obs_noise(np.asarray(gyro, dtype=dtype), noise.scale_gyro),
+            "joint_pos_rel": self._obs_noise(joint_pos_rel, noise.scale_joint_angle),
+            "dof_vel": self._obs_noise(dof_vel, noise.scale_joint_vel),
             "last_actions": last_actions,
-            "gravity_dir": gravity_dir,
+            "gravity_dir": self._obs_noise(gravity_dir, noise.scale_gravity),
         }
         if is_reset:
             self._fill_history(env_ids, components)
