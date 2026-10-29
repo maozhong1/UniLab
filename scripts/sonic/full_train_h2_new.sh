@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# H2 SONIC from-scratch curriculum: 1 (base clips) -> 2.5 (+manipulation) -> 2.8 (harder clips).
+# H2 SONIC from-scratch curriculum: 1 (base clips) -> 2.5 (+manipulation) -> 2.8 (harder clips)
+# -> 2.85 (upper-body refinement).
 # Standalone: does not call or share state with full_train_h2.sh.
 #
 #   * gains: robots/h2/h2.xml as is (official hips/knees/hip yaw 200/4, ankle roll 40/2,
@@ -24,6 +25,7 @@ set -euo pipefail
 #   CURRICULUM_STAGE=1   bash scripts/sonic/full_train_h2_new.sh
 #   CURRICULUM_STAGE=2.5 LOAD_RUN=<stage-1 run dir>   bash scripts/sonic/full_train_h2_new.sh
 #   CURRICULUM_STAGE=2.8 LOAD_RUN=<stage-2.5 run dir> bash scripts/sonic/full_train_h2_new.sh
+#   CURRICULUM_STAGE=2.85 LOAD_RUN=<stage-2.8 run dir> CHECKPOINT=<best hold> bash scripts/sonic/full_train_h2_new.sh
 # Every variable below can be overridden from the environment. DRY_RUN=1 prepares the data
 # and checks the Hydra compose without training.
 
@@ -41,6 +43,8 @@ STRICT_ANCHOR_ORI_ERROR_SQ="${STRICT_ANCHOR_ORI_ERROR_SQ:-0.80}"
 STRICT_HEIGHT_THRESHOLD="${STRICT_HEIGHT_THRESHOLD:-0.45}"
 ANTI_SHAKE_ANG_VEL_SCALE="${ANTI_SHAKE_ANG_VEL_SCALE:-2.5e-3}"
 ANTI_SHAKE_ANG_VEL_SCALE="-${ANTI_SHAKE_ANG_VEL_SCALE#-}"
+# Wrist/head angular-speed deadzone (rad/s) of anti_shake_ang_vel; set per stage below.
+ANTI_SHAKE_THRESHOLD="${ANTI_SHAKE_THRESHOLD:-}"
 # Official SONIC H2 feet_acc weight (G1 default -2.5e-7); ankle pitch here is stiffer than
 # the official 40, so the ankle-acceleration penalty matters at least as much.
 JOINT_ACC_L2_SCALE="${JOINT_ACC_L2_SCALE:--2.5e-6}"
@@ -97,8 +101,27 @@ case "$CURRICULUM_STAGE" in
     # Rare stop / backward / manipulation clips get extra weight.
     : "${EXTRA_FOCUS:=walk_backward_stop_*:4 walk_backward_loop_*:2 walk_forward_stop_*:2 *peeling*:3 *washing*:3 *lighter*:3 *operating*:2}"
     ;;
+  2.85)
+    # Upper-body refinement on the 2.8 clip set. Through 2.8 the wrists never tracked
+    # (reference wrist roll +-80 deg, policy kept it within ~+-15 deg), while reference wrist
+    # speed exceeds 1.5 rad/s in 12-39% of manipulation/dance frames: raise the anti_shake
+    # deadzone above the reference speeds and tighten upper-body tracking.
+    FILTER_ARGS=(--body-ang-p99 10.0 --joint-vel-p99 8.5 --base-lin-p99 2.0 --base-ang-p99 3.5
+                 --base-z-range 0.30 --foot-height-max 0.55)
+    MERGE_MANIPULATION=1
+    : "${MAX_ITERATIONS:=1000}"
+    : "${LEARNING_RATE:=1e-5}" "${ADAPTIVE_LR_MAX:=1e-4}" "${ENTROPY_COEF:=0.002}"
+    : "${ROOT_POS_SCALE:=0.75}" "${ACTION_RATE_L2_SCALE:=0.0}" "${TARGET_RATE_L2_SCALE:=-0.05}"
+    : "${UPPER_BODY_JOINT_POS_SCALE:=2.0}" "${STD_UPPER_BODY_JOINT_POS:=0.35}"
+    : "${ANTI_SHAKE_THRESHOLD:=4.0}"
+    : "${JOINT_SOFT_LIMIT_SCALE:=-3.0}" "${JOINT_TARGET_LIMIT_SCALE:=-1.0}"
+    : "${HOLD_TAIL_S:=2.0}"
+    : "${CRITIC_WARMUP:=30}"
+    : "${FOCUS_PATTERN:=*macarena*.npz}" "${FOCUS_REPEAT:=5}"
+    : "${EXTRA_FOCUS:=walk_backward_stop_*:4 walk_backward_loop_*:2 walk_forward_stop_*:2 *peeling*:3 *washing*:3 *lighter*:3 *operating*:2}"
+    ;;
   *)
-    echo "ERROR: CURRICULUM_STAGE must be 1, 2.5 or 2.8" >&2
+    echo "ERROR: CURRICULUM_STAGE must be 1, 2.5, 2.8 or 2.85" >&2
     exit 2
     ;;
 esac
@@ -251,6 +274,7 @@ TRAIN_ARGS=(
   "reward.scales.joint_soft_limit=$JOINT_SOFT_LIMIT_SCALE"
   "reward.scales.joint_target_limit=$JOINT_TARGET_LIMIT_SCALE"
   "reward.std_upper_body_joint_pos=$STD_UPPER_BODY_JOINT_POS"
+  "++reward.anti_shake_threshold=${ANTI_SHAKE_THRESHOLD:-1.5}"
   "env.strict_foot_pos_threshold=$STRICT_FOOT_POS_THRESHOLD"
   "env.strict_anchor_ori_error_sq=$STRICT_ANCHOR_ORI_ERROR_SQ"
   "env.strict_height_threshold=$STRICT_HEIGHT_THRESHOLD"
@@ -265,7 +289,7 @@ TRAIN_ARGS=(
 SUMMARY="stage=$CURRICULUM_STAGE entries=${#NPZ_FILES[@]} hold_tail_s=$HOLD_TAIL_S iters=+$MAX_ITERATIONS \
 lr=$LEARNING_RATE lr_max=$ADAPTIVE_LR_MAX entropy=$ENTROPY_COEF root_pos=$ROOT_POS_SCALE \
 action_rate=$ACTION_RATE_L2_SCALE target_rate=$TARGET_RATE_L2_SCALE upper=$UPPER_BODY_JOINT_POS_SCALE/std$STD_UPPER_BODY_JOINT_POS \
-feet_slide=$FEET_SLIDE_SCALE feet_yaw=$FEET_YAW_SCALE joint_acc=$JOINT_ACC_L2_SCALE soft_limit=$JOINT_SOFT_LIMIT_SCALE \
+anti_shake_thr=${ANTI_SHAKE_THRESHOLD:-1.5} feet_slide=$FEET_SLIDE_SCALE feet_yaw=$FEET_YAW_SCALE joint_acc=$JOINT_ACC_L2_SCALE soft_limit=$JOINT_SOFT_LIMIT_SCALE \
 target_limit=$JOINT_TARGET_LIMIT_SCALE critic_warmup=$CRITIC_WARMUP focus=[$FOCUS_PATTERN x$FOCUS_REPEAT] extra=[$EXTRA_FOCUS]"
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
