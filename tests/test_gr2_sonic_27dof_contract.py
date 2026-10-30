@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import mujoco
 import numpy as np
+import pytest
 import torch
 from scripts.motion.g1_csv_to_gr2_npz import _scalar_joints, _validate_target
 from tensordict import TensorDict
@@ -350,3 +351,72 @@ def test_gr2_sonic_physics_scene_matches_full_scene_dynamics_contract() -> None:
         np.testing.assert_allclose(light.geom_pos[light_id], full.geom_pos[full_id])
     assert light.ntex == 0
     assert light.nmeshface < full.nmeshface // 20
+
+
+def test_gr2_sonic_action_delay_holds_previous_target_for_leading_substeps() -> None:
+    cfg = GR2SonicMotionTrackingCfg(critic_privileged_mf_hist=True)
+    cfg.domain_rand.randomize_action_delay = True
+    cfg.domain_rand.action_delay_substeps = [2, 2]
+    cfg.sim_dt = 0.005
+    env = GR2SonicMotionTrackingEnv(cfg, num_envs=2, backend_type="mujoco")
+    env.init_state()
+    np.testing.assert_array_equal(env._state.info["action_delay_substeps"], [2, 2])
+
+    previous = np.full((2, 27), 0.3, dtype=np.float32)
+    current = np.full((2, 27), -0.4, dtype=np.float32)
+    env._state.info["current_actions"] = previous
+    trajectory = env.apply_action(current, env._state)
+
+    scale = env._cfg.control_config.action_scale
+    assert cfg.sim_substeps == 4
+    assert trajectory.shape == (2, 4, 27)
+    for substep in range(2):
+        np.testing.assert_allclose(
+            trajectory[:, substep], previous * scale + env.default_angles, rtol=1e-6
+        )
+    for substep in range(2, 4):
+        np.testing.assert_allclose(
+            trajectory[:, substep], current * scale + env.default_angles, rtol=1e-6
+        )
+
+
+def test_mujoco_constant_control_trajectory_matches_held_control() -> None:
+    from unilab.base.backend import create_backend
+    from unilab.base.scene import SceneCfg
+
+    scene = SceneCfg(model_file=str(_ASSET_DIR / "scene_sonic_27dof.xml"))
+    results = []
+    for as_trajectory in (False, True):
+        backend = create_backend("mujoco", scene, 2, 0.005)
+        backend.materialize()
+        ctrl = np.tile(np.linspace(-0.2, 0.2, 27), (2, 1))
+        if as_trajectory:
+            ctrl = np.repeat(ctrl[:, None, :], 4, axis=1)
+        backend.step(ctrl, 4)
+        results.append(backend.get_dof_pos().copy())
+    assert backend.supports_control_trajectory
+    np.testing.assert_array_equal(results[0], results[1])
+    with pytest.raises(ValueError, match="control trajectory"):
+        backend.step(np.zeros((2, 3, 27)), 4)
+
+
+def test_gr2_sonic_random_action_delay_steps_and_validates_range() -> None:
+    cfg = GR2SonicMotionTrackingCfg(critic_privileged_mf_hist=True)
+    cfg.domain_rand.randomize_action_delay = True
+    cfg.domain_rand.action_delay_substeps = [1, 4]
+    cfg.sim_dt = 0.005
+    env = GR2SonicMotionTrackingEnv(cfg, num_envs=64, backend_type="mujoco")
+    np.random.seed(0)
+    env.init_state()
+    delay = env._state.info["action_delay_substeps"]
+    assert delay.min() >= 1 and delay.max() <= 4 and np.unique(delay).size > 1
+    for _ in range(3):
+        state = env.step(np.zeros((64, 27), dtype=np.float32))
+    assert all(np.isfinite(value).all() for value in state.obs.values())
+
+    bad = GR2SonicMotionTrackingCfg()
+    bad.domain_rand.randomize_action_delay = True
+    bad.domain_rand.action_delay_substeps = [1, 5]
+    bad.sim_dt = 0.005
+    with pytest.raises(ValueError, match="action_delay_substeps"):
+        GR2SonicMotionTrackingEnv(bad, num_envs=1, backend_type="mujoco")

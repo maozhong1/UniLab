@@ -96,6 +96,8 @@ class SimBackend(abc.ABC):
     _pre_step_control_fn: PreStepControlFn | None
     _scene_cleanup_handle: Any | None
     backend_type: str
+    # Whether ``step`` accepts a per-substep control trajectory ``(num_envs, nsteps, nu)``.
+    supports_control_trajectory: bool = False
 
     # ------------------------------------------------------------------ #
     # Properties                                                           #
@@ -295,7 +297,9 @@ class SimBackend(abc.ABC):
         """Advance physics.
 
         Args:
-            ctrl: Control input with shape ``(num_envs, nu)``.
+            ctrl: Control input with shape ``(num_envs, nu)``, held for all substeps. Backends
+                with ``supports_control_trajectory`` also accept ``(num_envs, nsteps, nu)``,
+                one control row per substep; others must reject a 3-D ``ctrl``.
             nsteps: Number of physics substeps.
 
         Returns:

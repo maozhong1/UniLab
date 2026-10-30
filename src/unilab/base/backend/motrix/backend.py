@@ -568,6 +568,8 @@ class MotrixBackend(SimBackend):
     # ------------------------------------------------------------------ #
 
     def step(self, ctrl: np.ndarray, nsteps: int = 1) -> dict | None:
+        if np.ndim(ctrl) == 3:
+            raise NotImplementedError(f"{self.backend_type} backend does not support control trajectories")
         if self._pre_step_control_fn is not None:
             return self._step_with_pre_step_control(ctrl, nsteps)
 

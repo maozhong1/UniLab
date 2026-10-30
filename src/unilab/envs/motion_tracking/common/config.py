@@ -81,6 +81,12 @@ class DomainRand:
     randomize_joint_armature: bool = False
     joint_armature_multiplier_range: list[float] = field(default_factory=lambda: [0.8, 1.2])
 
+    # Per-episode actuation delay in physics substeps (inclusive range): the first d
+    # substeps of each control step keep the previous PD target. Excludes
+    # control_config.simulate_action_latency (fixed one-control-step delay).
+    randomize_action_delay: bool = False
+    action_delay_substeps: list[int] = field(default_factory=lambda: [1, 4])
+
 
 # Backward-compatible alias for the historical (snake_case) class name.
 Domain_Rand = DomainRand

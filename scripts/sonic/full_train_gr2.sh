@@ -7,6 +7,8 @@ set -euo pipefail
 # into the base dataset before filtering. Set NPZ_DIR to bypass filtering.
 # DR_STAGE=A|B adds sim2real domain randomization (A: light, no push; B: full + push + armature).
 # CRITIC_WARMUP=N freezes the actor for the first N iterations of this run (default 30 with DR).
+# ACTION_DELAY=LO,HI randomizes a per-episode actuation delay of LO..HI physics substeps
+# (5 ms each at sim_dt=0.005; e.g. 1,4 = 5-20 ms). Requires DR_STAGE=A or B.
 
 UNILAB="${UNILAB:-/home/maozhong/work/my_sonic/UniLab}"
 SOURCE_NPZ_DIR="${SOURCE_NPZ_DIR:-$HOME/work/sonic_vla_infer/bones_seed_3k_new/npz_gr2_27dof}"
@@ -121,6 +123,17 @@ if [[ "$DR_STAGE" == "none" ]]; then
   CRITIC_WARMUP="${CRITIC_WARMUP:-0}"
 else
   CRITIC_WARMUP="${CRITIC_WARMUP:-30}"
+fi
+ACTION_DELAY="${ACTION_DELAY:-}"
+if [[ -n "$ACTION_DELAY" ]]; then
+  if [[ "$DR_STAGE" == "none" || ! "$ACTION_DELAY" =~ ^[0-9]+,[0-9]+$ ]]; then
+    echo "ERROR: ACTION_DELAY must look like LO,HI and needs DR_STAGE=A or B" >&2
+    exit 2
+  fi
+  DR_ARGS+=(
+    ++env.domain_rand.randomize_action_delay=true
+    "++env.domain_rand.action_delay_substeps=[$ACTION_DELAY]"
+  )
 fi
 if [[ ! "$CRITIC_WARMUP" =~ ^[0-9]+$ ]]; then
   echo "ERROR: CRITIC_WARMUP must be a non-negative integer" >&2
@@ -358,7 +371,7 @@ TRAIN_ARGS=(
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   uv run --no-sync python scripts/train_rsl_rl.py "${TRAIN_ARGS[@]}" --cfg job >/dev/null
-  echo "Hydra compose passed (stage=$CURRICULUM_STAGE, motion_entries=${#NPZ_FILES[@]}, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD, dr_stage=$DR_STAGE, critic_warmup=$CRITIC_WARMUP)"
+  echo "Hydra compose passed (stage=$CURRICULUM_STAGE, motion_entries=${#NPZ_FILES[@]}, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD, dr_stage=$DR_STAGE, critic_warmup=$CRITIC_WARMUP, action_delay=${ACTION_DELAY:-none})"
   exit 0
 fi
 
@@ -366,4 +379,4 @@ LOG="$WORK_DIR/full_train_gr2_stage${CURRICULUM_STAGE}_$(date +%Y%m%d_%H%M%S).lo
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 setsid nohup uv run --no-sync python scripts/train_rsl_rl.py "${TRAIN_ARGS[@]}" \
   > "$LOG" 2>&1 < /dev/null &
-echo "launched GR2 stage $CURRICULUM_STAGE (${#NPZ_FILES[@]} motion entries, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD, dr_stage=$DR_STAGE, critic_warmup=$CRITIC_WARMUP), log=$LOG"
+echo "launched GR2 stage $CURRICULUM_STAGE (${#NPZ_FILES[@]} motion entries, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD, dr_stage=$DR_STAGE, critic_warmup=$CRITIC_WARMUP, action_delay=${ACTION_DELAY:-none}), log=$LOG"

@@ -33,6 +33,7 @@ class MotionTrackingEnv(G1BaseEnv):
     """Motion Tracking Environment (robot-agnostic imitation engine)."""
 
     _cfg: MotionTrackingCfg
+    _action_delay_enabled: bool = False
 
     def __init__(self, cfg: MotionTrackingCfg, num_envs=1, backend_type="mujoco"):
         if not cfg.motion_file:
@@ -117,6 +118,26 @@ class MotionTrackingEnv(G1BaseEnv):
             joint_dof_ids=joint_dof_ids,
         )
         self._init_domain_randomization(dr_provider)
+        self._action_delay_enabled = bool(cfg.domain_rand.randomize_action_delay)
+        if self._action_delay_enabled:
+            low, high = cfg.domain_rand.action_delay_substeps
+            if not 0 <= low <= high <= cfg.sim_substeps:
+                raise ValueError(
+                    f"action_delay_substeps {cfg.domain_rand.action_delay_substeps} must lie "
+                    f"within [0, sim_substeps={cfg.sim_substeps}]"
+                )
+            if cfg.control_config.simulate_action_latency:
+                raise ValueError(
+                    "randomize_action_delay and simulate_action_latency are mutually exclusive"
+                )
+            if not backend.supports_control_trajectory:
+                raise NotImplementedError(
+                    f"{backend.backend_type} backend does not support randomize_action_delay"
+                )
+            dtype = get_global_dtype()
+            self._delay_prev_ctrl = np.zeros((num_envs, self._num_action), dtype=dtype)
+            self._delay_traj = np.zeros((num_envs, cfg.sim_substeps, self._num_action), dtype=dtype)
+            self._delay_substep_index = np.arange(cfg.sim_substeps, dtype=np.int32)
 
         dtype = get_global_dtype()
         n_body = len(cfg.body_names)
@@ -212,6 +233,23 @@ class MotionTrackingEnv(G1BaseEnv):
         bias = state.info.get("default_dof_pos_bias")
         base = self.default_angles + bias if bias is not None else self.default_angles
         ctrl: np.ndarray = exec_actions * self._cfg.control_config.action_scale + base
+        delay = state.info.get("action_delay_substeps") if self._action_delay_enabled else None
+        if delay is not None:
+            # Per-substep control trajectory: the first ``delay`` substeps of this control
+            # step keep the previous PD target (zero last_actions after reset -> base pose).
+            np.multiply(
+                state.info["last_actions"], self._cfg.control_config.action_scale,
+                out=self._delay_prev_ctrl,
+            )
+            self._delay_prev_ctrl += base
+            hold = delay[:, None] > self._delay_substep_index[None, :]
+            np.copyto(self._delay_traj, ctrl[:, None, :])
+            np.copyto(
+                self._delay_traj,
+                np.broadcast_to(self._delay_prev_ctrl[:, None, :], self._delay_traj.shape),
+                where=hold[:, :, None],
+            )
+            return self._delay_traj
         return ctrl
 
     def _resample_reference_state(self, env_ids: np.ndarray) -> None:

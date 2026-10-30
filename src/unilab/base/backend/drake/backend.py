@@ -384,6 +384,8 @@ class DrakeBackend(SimBackend):
 
     # Stepping and reset.
     def step(self, ctrl: np.ndarray, nsteps: int = 1) -> dict | None:
+        if np.ndim(ctrl) == 3:
+            raise NotImplementedError(f"{self.backend_type} backend does not support control trajectories")
         # UniLab passes one actuator command per env. An optional pre-step hook
         # can convert policy actions into backend-native position targets.
         step_count = int(nsteps)

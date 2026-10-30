@@ -268,6 +268,8 @@ def _build_mujoco_scene_context(scene: SceneCfg) -> _MuJoCoSceneContext:
 class MuJoCoBackend(SimBackend):
     """MuJoCo backend implementation."""
 
+    supports_control_trajectory = True
+
     def __init__(
         self,
         scene: SceneCfg,
@@ -844,11 +846,23 @@ class MuJoCoBackend(SimBackend):
     # ------------------------------------------------------------------ #
 
     def step(self, ctrl: np.ndarray, nsteps: int = 1) -> dict | None:
-        if self._pre_step_control_fn is not None:
+        if ctrl.ndim == 3:
+            if self._pre_step_control_fn is not None:
+                raise ValueError("control trajectories cannot be combined with pre-step control")
+            if ctrl.shape[:2] != (self._num_envs, nsteps):
+                raise ValueError(
+                    f"control trajectory must have shape ({self._num_envs}, {nsteps}, nu), "
+                    f"got {ctrl.shape}"
+                )
+        elif self._pre_step_control_fn is not None:
             return self._step_with_pre_step_control(ctrl, nsteps)
 
         t0 = time.perf_counter()
-        control_traj = np.broadcast_to(ctrl[:, None, :], (self._num_envs, nsteps, ctrl.shape[-1]))
+        control_traj = (
+            ctrl
+            if ctrl.ndim == 3
+            else np.broadcast_to(ctrl[:, None, :], (self._num_envs, nsteps, ctrl.shape[-1]))
+        )
         control_spec = int(mujoco.mjtState.mjSTATE_CTRL)
         if np.any(self._pending_xfrc_applied):
             control_spec |= int(mujoco.mjtState.mjSTATE_XFRC_APPLIED)

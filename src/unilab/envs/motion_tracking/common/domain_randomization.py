@@ -129,6 +129,12 @@ class MotionTrackingDomainRandomizationProvider(DomainRandomizationProvider):
             payload.dof_armature = dof_armature
             randomization = payload
 
+        if getattr(dr_cfg, "randomize_action_delay", False):
+            low, high = dr_cfg.action_delay_substeps
+            info_updates["action_delay_substeps"] = np.random.randint(
+                low, high + 1, size=(num_reset,), dtype=np.int32
+            )
+
         if getattr(dr_cfg, "randomize_joint_default_pos", False):
             low, high = dr_cfg.joint_default_pos_range
             info_updates["default_dof_pos_bias"] = np.random.uniform(
