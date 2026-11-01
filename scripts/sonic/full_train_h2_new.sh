@@ -18,6 +18,8 @@ set -euo pipefail
 #     from ~7 lifts / 23 cm drift to 0 lifts / <2 cm on the 6 s hold suite by iter 1800.
 #   * rewards otherwise follow the official SONIC H2 config (gear_sonic sonic_h2.yaml):
 #     no feet_yaw, feet_acc (joint_acc_l2) at -2.5e-6.
+#   * stage 2.85 adds motion_local_points=2.0 (pelvis-frame wrists/ankles) and
+#     undesired_contacts=-0.1 (non-EE body-height proxy, not contact force).
 # Gate every stage on the hold test (utility/h2_hold), not on training curves alone.
 #
 # Usage (stage 1 from scratch; later stages resume the previous run's newest checkpoint
@@ -26,6 +28,11 @@ set -euo pipefail
 #   CURRICULUM_STAGE=2.5 LOAD_RUN=<stage-1 run dir>   bash scripts/sonic/full_train_h2_new.sh
 #   CURRICULUM_STAGE=2.8 LOAD_RUN=<stage-2.5 run dir> bash scripts/sonic/full_train_h2_new.sh
 #   CURRICULUM_STAGE=2.85 LOAD_RUN=<stage-2.8 run dir> CHECKPOINT=<best hold> bash scripts/sonic/full_train_h2_new.sh
+# Resume stage 2.85 checkpoint 5100 with the two added rewards (1000 more iterations):
+#   CURRICULUM_STAGE=2.85 LOAD_RUN=2026-10-29_09-41-57_mujoco CHECKPOINT=5100 \
+#     MAX_ITERATIONS=1000 bash scripts/sonic/full_train_h2_new.sh
+# MOTION_LOCAL_POINTS_SCALE / UNDESIRED_CONTACTS_SCALE override the stage defaults;
+# set both to 0.0 to reproduce the old stage-2.85 reward configuration.
 # Every variable below can be overridden from the environment. DRY_RUN=1 prepares the data
 # and checks the Hydra compose without training.
 
@@ -113,6 +120,7 @@ case "$CURRICULUM_STAGE" in
     : "${LEARNING_RATE:=1e-5}" "${ADAPTIVE_LR_MAX:=1e-4}" "${ENTROPY_COEF:=0.002}"
     : "${ROOT_POS_SCALE:=0.75}" "${ACTION_RATE_L2_SCALE:=0.0}" "${TARGET_RATE_L2_SCALE:=-0.05}"
     : "${UPPER_BODY_JOINT_POS_SCALE:=2.0}" "${STD_UPPER_BODY_JOINT_POS:=0.35}"
+    : "${MOTION_LOCAL_POINTS_SCALE:=2.0}" "${UNDESIRED_CONTACTS_SCALE:=-0.1}"
     : "${ANTI_SHAKE_THRESHOLD:=4.0}"
     : "${JOINT_SOFT_LIMIT_SCALE:=-3.0}" "${JOINT_TARGET_LIMIT_SCALE:=-1.0}"
     : "${HOLD_TAIL_S:=2.0}"
@@ -125,6 +133,7 @@ case "$CURRICULUM_STAGE" in
     exit 2
     ;;
 esac
+: "${MOTION_LOCAL_POINTS_SCALE:=0.0}" "${UNDESIRED_CONTACTS_SCALE:=0.0}"
 
 if [[ "$CURRICULUM_STAGE" != "1" && -z "${LOAD_RUN:-}" ]]; then
   echo "ERROR: LOAD_RUN is required for stage $CURRICULUM_STAGE" >&2
@@ -266,6 +275,8 @@ TRAIN_ARGS=(
   "reward.scales.action_rate_l2=$ACTION_RATE_L2_SCALE"
   "reward.scales.target_rate_l2=$TARGET_RATE_L2_SCALE"
   "reward.scales.upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE"
+  "reward.scales.motion_local_points=$MOTION_LOCAL_POINTS_SCALE"
+  "reward.scales.undesired_contacts=$UNDESIRED_CONTACTS_SCALE"
   "reward.scales.joint_acc_l2=$JOINT_ACC_L2_SCALE"
   reward.scales.joint_torque_l2=-1.0e-6
   "reward.scales.anti_shake_ang_vel=$ANTI_SHAKE_ANG_VEL_SCALE"
@@ -289,6 +300,7 @@ TRAIN_ARGS=(
 SUMMARY="stage=$CURRICULUM_STAGE entries=${#NPZ_FILES[@]} hold_tail_s=$HOLD_TAIL_S iters=+$MAX_ITERATIONS \
 lr=$LEARNING_RATE lr_max=$ADAPTIVE_LR_MAX entropy=$ENTROPY_COEF root_pos=$ROOT_POS_SCALE \
 action_rate=$ACTION_RATE_L2_SCALE target_rate=$TARGET_RATE_L2_SCALE upper=$UPPER_BODY_JOINT_POS_SCALE/std$STD_UPPER_BODY_JOINT_POS \
+local_points=$MOTION_LOCAL_POINTS_SCALE undesired_contacts=$UNDESIRED_CONTACTS_SCALE \
 anti_shake_thr=${ANTI_SHAKE_THRESHOLD:-1.5} feet_slide=$FEET_SLIDE_SCALE feet_yaw=$FEET_YAW_SCALE joint_acc=$JOINT_ACC_L2_SCALE soft_limit=$JOINT_SOFT_LIMIT_SCALE \
 target_limit=$JOINT_TARGET_LIMIT_SCALE critic_warmup=$CRITIC_WARMUP focus=[$FOCUS_PATTERN x$FOCUS_REPEAT] extra=[$EXTRA_FOCUS]"
 
