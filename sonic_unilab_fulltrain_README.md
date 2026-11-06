@@ -390,12 +390,6 @@ Stage 2.5 also replaces the raw action-difference penalty with
 changes policy inputs, outputs, action scaling, or checkpoint shapes, so an existing
 27-DoF checkpoint remains resume-compatible.
 
-TensorBoard rollout logs include overlapping per-step termination rates under
-`termination/*` and total/upper-body requested-PD-torque saturation estimates under
-`diagnostic/*`. The saturation values compare requested PD torque with the limits
-implied by the fixed GR2 action-scale contract; they are estimates, not measured
-actuator-force telemetry.
-
 Stage 2.8 merges the same base and upright-manipulation sources, then admits moderately
 more dynamic clips than Stage 2.5. To resume the exact checkpoint instead of the newest
 checkpoint in the run directory:
@@ -421,13 +415,6 @@ Stage 2.8 also defaults to `FOCUS_PATTERN='*macarena*.npz'` and
 frame-weighted probability under mixed sampling from `1.65%` to `7.73%`. Repetition
 duplicates paths only in the generated Hydra motion list; it does not copy NPZ files.
 Set `FOCUS_REPEAT=1` to disable focus oversampling.
-
-Stage 2.8 keeps the permissive Stage 2.5 termination gates while the policy adapts to
-the broader distribution. Stage 3 defaults to `strict_foot_pos_threshold=0.45`,
-`strict_anchor_ori_error_sq=0.70`, and `strict_height_threshold=0.40`. The orientation
-value is squared geodesic error: `0.80` and `0.70` correspond to approximately `51.2`
-and `47.9` degrees. These gates prevent collapsed tracking; they are not precision
-targets.
 
 Continue Stage 3 from the Stage 2.8 run:
 
@@ -483,6 +470,11 @@ The launcher accepts these environment variables:
 | `STRICT_FOOT_POS_THRESHOLD` | stage-dependent | `0.50` for Stage 2.8; `0.45` for Stage 3 |
 | `STRICT_ANCHOR_ORI_ERROR_SQ` | stage-dependent | `0.80` for Stage 2.8; `0.70` for Stage 3 |
 | `STRICT_HEIGHT_THRESHOLD` | stage-dependent | `0.45` for Stage 2.8; `0.40` for Stage 3 |
+| `DR_STAGE` | `none` | `none`, `A`, or `B` sim2real domain randomization; see Section 5.6 |
+| `CRITIC_WARMUP` | `30` with DR, else `0` | freeze the actor for the first N iterations of this run |
+| `ACTION_DELAY` | unset | `LO,HI` per-episode actuation delay in 5 ms physics substeps; needs `DR_STAGE=A` or `B` |
+| `PUSH_FORCE_XY` / `PUSH_FORCE_Z` | `600` / `150` | Stage B push force limits in N |
+| `FOOT_CONTACT` | `default` | `real` uses the real-robot foot contact scene |
 | `INIT_STD` | `0.50` | construction value; restored actor std wins on resume |
 | `NUM_ENVS` | `4096` | parallel environments |
 | `NUM_STEPS` | `24` | rollout steps per environment |
@@ -498,6 +490,65 @@ NPZ_DIR=/path/to/small_gr2_subset \
 CURRICULUM_STAGE=1 NUM_ENVS=4 NUM_STEPS=2 MAX_ITERATIONS=1 SAVE_INTERVAL=1 \
   ./scripts/sonic/full_train_gr2.sh
 ```
+
+### 5.6 Sim2Real Domain Randomization (based on Stage 2.8)
+
+Domain randomization (DR) is a fine-tuning pass on top of a trained curriculum
+checkpoint. The current GR2 deploy policy uses DR on top of Stage 2.8: it keeps
+`CURRICULUM_STAGE=2.8` (same data, reward, and termination gates) and adds DR in three
+stages, each resumed from the best checkpoint of the previous one. DR does not change
+policy inputs, outputs, or checkpoint shapes.
+
+| Stage | Resume from | Randomization |
+|---|---|---|
+| A | Stage 2.8 | friction `[0.4,1.2]`, pelvis added mass `[-1.0,2.0]` kg, COM offset ±2/3/3 cm, kp/kd ×`[0.9,1.1]`, default joint pos ±0.01 rad, obs noise level 0.5 |
+| B | Stage A | friction `[0.3,1.6]`, added mass `[-1.5,3.0]` kg, COM ±2.5/5/5 cm, kp/kd ×`[0.85,1.15]`, default joint pos ±0.02 rad, joint armature ×`[0.8,1.2]`, obs noise level 1.0, pushes every 250 steps (600 N xy / 150 N z) |
+| C | Stage B | Stage B plus a per-episode actuation delay of 1–4 substeps (5–20 ms) |
+
+The commands below are examples; set `LOAD_RUN` and `CHECKPOINT` to your own run
+directory and the best checkpoint of the previous stage.
+
+Stage A (light DR, no push), example:
+
+```bash
+CURRICULUM_STAGE=2.8 DR_STAGE=A \
+LOAD_RUN=2026-10-01_20-18-04_mujoco CHECKPOINT=12899 \
+MAX_ITERATIONS=1500 ./scripts/sonic/full_train_gr2.sh
+```
+
+Stage B (wider DR, pushes, joint armature), example:
+
+```bash
+CURRICULUM_STAGE=2.8 DR_STAGE=B CRITIC_WARMUP=30 \
+LOAD_RUN=2026-10-29_23-23-10_mujoco CHECKPOINT=13600 \
+MAX_ITERATIONS=2500 ./scripts/sonic/full_train_gr2.sh
+```
+
+Stage C (actuation delay), example:
+
+```bash
+CURRICULUM_STAGE=2.8 DR_STAGE=B ACTION_DELAY=1,4 CRITIC_WARMUP=20 \
+LOAD_RUN=2026-10-30_13-13-27_mujoco CHECKPOINT=14200 \
+MAX_ITERATIONS=1500 ./scripts/sonic/full_train_gr2.sh
+```
+
+The delay holds the previous PD target for the first `d` physics substeps of each
+control step, with `d` drawn per episode from `[LO, HI]`. It runs on the MuJoCo backend
+through a per-substep control trajectory (about 2–5% overhead). 
+
+Notes:
+
+- `CRITIC_WARMUP` lets the value function adapt to the randomized dynamics before the
+  actor is updated. It defaults to 30 iterations whenever `DR_STAGE` is set.
+- Reset-time model DR makes MuJoCo clone the full model per environment. With the full
+  GR2 scene (about 50 MB) this runs out of memory at 4096 envs, so with DR the launcher
+  trains on `scene_sonic_27dof_physics.xml` (about 1.6 MB per env, generated by
+  `scripts/sonic/build_gr2_physics_scene.py`: visual meshes stripped, collision meshes
+  reduced to convex hulls, soles unchanged) and keeps the full scene for rendering.
+- The physics scene sets floor friction to 0.1, so sole friction DR below 1.0 takes
+  effect.
+- `FOOT_CONTACT=real` switches to `scene_sonic_27dof_realfoot{,_physics}.xml` (thin sole
+  plate plus foot-mesh collision), and friction DR then covers both foot geoms.
 
 ## 6. Export Split ONNX
 
