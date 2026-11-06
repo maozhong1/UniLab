@@ -12,6 +12,9 @@ Bodies, inertials, joints, actuators, sensors, the foot-sole boxes and the keyfr
 unchanged. Rendering keeps using ``scene_sonic_27dof.xml`` via ``visual_model_file``.
 
     uv run --no-sync python scripts/sonic/build_gr2_physics_scene.py
+    uv run --no-sync python scripts/sonic/build_gr2_physics_scene.py \
+        --source src/unilab/assets/robots/gr2/scene_sonic_27dof_realfoot.xml \
+        --output src/unilab/assets/robots/gr2/scene_sonic_27dof_realfoot_physics.xml
 """
 
 from __future__ import annotations
@@ -84,9 +87,10 @@ def build(source: Path, maxhullvert: int) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--maxhullvert", type=int, default=128)
+    parser.add_argument("--source", type=Path, default=_SOURCE)
     parser.add_argument("--output", type=Path, default=_OUTPUT)
     args = parser.parse_args()
-    args.output.write_text(build(_SOURCE, args.maxhullvert))
+    args.output.write_text(build(args.source, args.maxhullvert))
     print(f"wrote {args.output}")
 
 

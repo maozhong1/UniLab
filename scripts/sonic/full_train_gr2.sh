@@ -9,6 +9,8 @@ set -euo pipefail
 # CRITIC_WARMUP=N freezes the actor for the first N iterations of this run (default 30 with DR).
 # ACTION_DELAY=LO,HI randomizes a per-episode actuation delay of LO..HI physics substeps
 # (5 ms each at sim_dt=0.005; e.g. 1,4 = 5-20 ms). Requires DR_STAGE=A or B.
+# FOOT_CONTACT=real swaps in the real-robot foot contact (thin sole plate + foot mesh
+# collision, scene_sonic_27dof_realfoot*.xml); friction DR then covers sole and mesh.
 
 UNILAB="${UNILAB:-/home/maozhong/work/my_sonic/UniLab}"
 SOURCE_NPZ_DIR="${SOURCE_NPZ_DIR:-$HOME/work/sonic_vla_infer/bones_seed_3k_new/npz_gr2_27dof}"
@@ -140,14 +142,31 @@ if [[ ! "$CRITIC_WARMUP" =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 
+FOOT_CONTACT="${FOOT_CONTACT:-default}"
+GR2_ASSET_DIR="$UNILAB/src/unilab/assets/robots/gr2"
+case "$FOOT_CONTACT" in
+  default)
+    GR2_SCENE=scene_sonic_27dof
+    ;;
+  real)
+    GR2_SCENE=scene_sonic_27dof_realfoot
+    DR_ARGS+=("++env.domain_rand.friction_geom_pattern='^[lr]_foot_(sole|mesh)\$'")
+    ;;
+  *)
+    echo "ERROR: FOOT_CONTACT must be default or real" >&2
+    exit 2
+    ;;
+esac
+
 if [[ "$DR_STAGE" != "none" ]]; then
   # Reset-time model DR clones the mjModel per env; the light physics scene keeps that
   # affordable at 4096 envs (see scripts/sonic/build_gr2_physics_scene.py).
-  GR2_ASSET_DIR="$UNILAB/src/unilab/assets/robots/gr2"
   DR_ARGS+=(
-    "++env.scene.model_file=$GR2_ASSET_DIR/scene_sonic_27dof_physics.xml"
-    "++env.scene.visual_model_file=$GR2_ASSET_DIR/scene_sonic_27dof.xml"
+    "++env.scene.model_file=$GR2_ASSET_DIR/${GR2_SCENE}_physics.xml"
+    "++env.scene.visual_model_file=$GR2_ASSET_DIR/${GR2_SCENE}.xml"
   )
+elif [[ "$FOOT_CONTACT" == "real" ]]; then
+  DR_ARGS+=("++env.scene.model_file=$GR2_ASSET_DIR/${GR2_SCENE}.xml")
 fi
 
 if [[ ! "$FOCUS_REPEAT" =~ ^[1-9][0-9]*$ ]]; then
@@ -370,8 +389,8 @@ TRAIN_ARGS=(
 )
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
-  uv run --no-sync python scripts/train_rsl_rl.py "${TRAIN_ARGS[@]}" --cfg job >/dev/null
-  echo "Hydra compose passed (stage=$CURRICULUM_STAGE, motion_entries=${#NPZ_FILES[@]}, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD, dr_stage=$DR_STAGE, critic_warmup=$CRITIC_WARMUP, action_delay=${ACTION_DELAY:-none})"
+  uv run --no-sync python scripts/train_rsl_rl.py "${TRAIN_ARGS[@]}" --cfg job > "${DRY_RUN_CFG_OUT:-/dev/null}"
+  echo "Hydra compose passed (stage=$CURRICULUM_STAGE, motion_entries=${#NPZ_FILES[@]}, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD, dr_stage=$DR_STAGE, critic_warmup=$CRITIC_WARMUP, action_delay=${ACTION_DELAY:-none}, foot_contact=$FOOT_CONTACT)"
   exit 0
 fi
 
@@ -379,4 +398,4 @@ LOG="$WORK_DIR/full_train_gr2_stage${CURRICULUM_STAGE}_$(date +%Y%m%d_%H%M%S).lo
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 setsid nohup uv run --no-sync python scripts/train_rsl_rl.py "${TRAIN_ARGS[@]}" \
   > "$LOG" 2>&1 < /dev/null &
-echo "launched GR2 stage $CURRICULUM_STAGE (${#NPZ_FILES[@]} motion entries, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD, dr_stage=$DR_STAGE, critic_warmup=$CRITIC_WARMUP, action_delay=${ACTION_DELAY:-none}), log=$LOG"
+echo "launched GR2 stage $CURRICULUM_STAGE (${#NPZ_FILES[@]} motion entries, focus=$FOCUS_PATTERN, focus_repeat=$FOCUS_REPEAT, lr=$LEARNING_RATE, adaptive_lr_max=$ADAPTIVE_LR_MAX, entropy=$ENTROPY_COEF, root_pos_scale=$ROOT_POS_SCALE, action_rate=$ACTION_RATE_L2_SCALE, target_rate=$TARGET_RATE_L2_SCALE, upper_body_joint_pos=$UPPER_BODY_JOINT_POS_SCALE, anti_shake=$ANTI_SHAKE_ANG_VEL_SCALE, strict_foot=$STRICT_FOOT_POS_THRESHOLD, strict_ori_sq=$STRICT_ANCHOR_ORI_ERROR_SQ, strict_height=$STRICT_HEIGHT_THRESHOLD, init_std=$INIT_STD, dr_stage=$DR_STAGE, critic_warmup=$CRITIC_WARMUP, action_delay=${ACTION_DELAY:-none}, foot_contact=$FOOT_CONTACT), log=$LOG"
