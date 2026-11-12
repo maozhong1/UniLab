@@ -65,6 +65,8 @@ _BODY_MAP: tuple[tuple[str, str], ...] = (
 )
 _ANCHOR_BODY = "base"
 _FOOT_BODIES = ("left_foot_roll_link", "right_foot_roll_link")
+_SUPPORT_PERCENTILE = 5.0
+_GROUND_SMOOTH_FRAMES = 5
 _HEAD_JOINTS = ("head_yaw_joint", "head_pitch_joint")
 
 _POS_WEIGHTS = {
@@ -361,8 +363,10 @@ def _build_targets(
     foot_offset,
     arm_shift=0.0,
     shoulder_half_width=1.0,
+    support_z=None,
 ):
-    support_z = min(source_pos[name][2] for name in _FOOT_BODIES)
+    if support_z is None:
+        support_z = min(source_pos[name][2] for name in _FOOT_BODIES)
     anchor_xy = source_pos[_ANCHOR_BODY][:2]
     target_pos = {}
     for name, position in source_pos.items():
@@ -394,6 +398,21 @@ def _gaussian_filter(values, sigma):
         [np.convolve(padded[:, column], kernel, mode="valid") for column in range(values.shape[1])],
         axis=1,
     )
+
+
+def _smooth_lift(lift, radius):
+    """Smooth upper envelope of per-frame root lifts (never below the required lift).
+
+    Lifting each penetrating frame on its own puts steps into the root height; a widened,
+    low-passed envelope removes the penetration without the vertical jerk.
+    """
+    if radius <= 0 or not lift.any():
+        return lift
+    padded = np.pad(lift, radius, mode="edge")
+    envelope = np.max(np.lib.stride_tricks.sliding_window_view(padded, 2 * radius + 1), axis=1)
+    for _ in range(3):
+        envelope = np.maximum(_gaussian_filter(envelope[:, None], radius / 2.0)[:, 0], lift)
+    return envelope
 
 
 def _arm_width_shift(g1_model_file, gr2_model_file, horizontal_scale):
@@ -611,6 +630,7 @@ def run_export(
     shoulder_half_width=1.0,
     collision_options=None,
     arm_filter_sigma=0.0,
+    support_reference="clip",
     progress=True,
 ):
     temporary_model, _, _ = inject_mujoco_tracking_sensors(model_file)
@@ -651,7 +671,9 @@ def run_export(
     hand_ids = [ik.body_ids[name] for name in _ARM_SHIFT_BODIES if name.endswith("hand_yaw_link")]
     hand_names = [name for name in _ARM_SHIFT_BODIES if name.endswith("hand_yaw_link")]
     frames = loader.output_frames
+    foot_ids = [ik.body_ids[name] for name in _FOOT_BODIES]
     hand_error = np.zeros(frames)
+    foot_error = np.zeros(frames)
     arm_pass = bool(arm_shift) or collision is not None
     body_qpos = None
     previous_arm = None
@@ -663,7 +685,22 @@ def run_export(
     data.qpos[:] = model.qpos0
     if model.nkey:
         mujoco.mj_resetDataKeyframe(model, data, 0)
-    foot_error = 0.0
+    support_z = None
+    if support_reference == "clip":
+        # One floor height per clip. Re-zeroing on the lowest foot every frame erases flight
+        # phases and jerks the root whenever the lowest foot switches (jog / dance kinks).
+        lowest = [
+            min(
+                source.poses(
+                    loader.motion_base_poss[frame],
+                    loader.motion_base_rots[frame],
+                    loader.motion_dof_poss[frame],
+                )[0][name][2]
+                for name in _FOOT_BODIES
+            )
+            for frame in range(frames)
+        ]
+        support_z = float(np.percentile(lowest, _SUPPORT_PERCENTILE))
     frame_iter = range(frames)
     if progress:
         frame_iter = tqdm(frame_iter, desc=f"{output_file.stem} ik", leave=False)
@@ -681,6 +718,7 @@ def run_export(
             horizontal_scale,
             vertical_scale,
             foot_offset,
+            support_z=support_z,
         )
         bias = _posture_bias(ik.joints, list(loader.joint_names), loader.motion_dof_poss[frame])
         steps = warm_iterations if frame == 0 else iterations
@@ -704,6 +742,7 @@ def run_export(
                 foot_offset,
                 arm_shift,
                 shoulder_half_width,
+                support_z=support_z,
             )
             # Pass 2: arm joints only, with the width shift and collision avoidance.
             if previous_arm is not None:
@@ -719,11 +758,6 @@ def run_export(
         frame_targets.append((target_pos, target_quat, bias))
         mujoco.mj_forward(model, data)
         qpos[frame] = data.qpos
-        if debug:
-            foot_error += sum(
-                np.linalg.norm(target_pos[name] - data.xpos[ik.body_ids[name]])
-                for name in _FOOT_BODIES
-            )
 
     repaired = 0
     if arm_pass and arm_filter_sigma > 0 and frames > 1:
@@ -751,10 +785,16 @@ def run_export(
             np.linalg.norm(frame_targets[frame][0][name] - data.xpos[body_id])
             for name, body_id in zip(hand_names, hand_ids, strict=True)
         )
+        # Measured before grounding, which only shifts the root to remove foot penetration.
+        foot_error[frame] = max(
+            np.linalg.norm(frame_targets[frame][0][name] - data.xpos[body_id])
+            for name, body_id in zip(_FOOT_BODIES, foot_ids, strict=True)
+        )
 
     lifted = 0
     maximum_penetration = 0.0
     if ground:
+        lift = np.zeros(frames)
         for frame in range(frames):
             data.qpos[:] = qpos[frame]
             mujoco.mj_forward(model, data)
@@ -768,9 +808,10 @@ def run_export(
                 or [0.0]
             )
             if penetration < -ground_tolerance:
-                qpos[frame, 2] -= penetration
-                lifted += 1
+                lift[frame] = -penetration
                 maximum_penetration = min(maximum_penetration, penetration)
+        lifted = int(np.count_nonzero(lift))
+        qpos[:, 2] += _smooth_lift(lift, _GROUND_SMOOTH_FRAMES)
 
     dt = 1.0 / loader.output_fps
     qvel = np.zeros((frames, model.nv))
@@ -824,7 +865,8 @@ def run_export(
     )
     stats = {
         "frames": frames,
-        "mean_foot_error": foot_error / max(2 * frames, 1),
+        "mean_foot_error": float(foot_error.mean()),
+        "max_foot_error": float(foot_error.max()),
         "grounded": lifted,
         "ground_penetration": -maximum_penetration,
         "avoided_frames": avoided,
@@ -869,6 +911,10 @@ def parse_args():
     parser.add_argument("--no_ground", action="store_true")
     parser.add_argument("--ground_tol", type=float, default=0.0)
     parser.add_argument(
+        "--support_reference", choices=("clip", "frame"), default="clip",
+        help="floor height for targets: one per clip (default) or the lowest foot of each frame (legacy)",
+    )
+    parser.add_argument(
         "--arm_shift", type=float, default=-1.0,
         help="outward arm-target shift (m); -1=auto shoulder-width difference, 0=off",
     )
@@ -912,9 +958,10 @@ def _convert_clip(csv_file, output_file, g1_model_xml, loader_kwargs, export_kwa
 
 _MANIFEST_FIELDS = (
     "name", "frames", "avoided_frames", "repaired_frames", "max_self_penetration", "self_penetration_run_s",
-    "mean_hand_error", "max_hand_error", "arm_acc_p99", "mean_foot_error", "grounded",
+    "mean_hand_error", "max_hand_error", "arm_acc_p99", "mean_foot_error", "max_foot_error", "grounded",
     "ground_penetration",
 )
+_MANIFEST_FLUSH_EVERY = 500
 
 
 def _write_manifest(output_dir: Path, rows: dict[str, dict]) -> Path:
@@ -925,11 +972,13 @@ def _write_manifest(output_dir: Path, rows: dict[str, dict]) -> Path:
         with path.open() as handle:
             merged = {row["name"]: row for row in csv.DictReader(handle)}
     merged.update(rows)
-    with path.open("w", newline="") as handle:
+    temporary = path.with_suffix(".csv.tmp")
+    with temporary.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=_MANIFEST_FIELDS, extrasaction="ignore")
         writer.writeheader()
         for name in sorted(merged):
             writer.writerow(merged[name])
+    temporary.replace(path)
     return path
 
 
@@ -994,6 +1043,7 @@ def main():
         debug=args.debug,
         ground=not args.no_ground,
         ground_tolerance=args.ground_tol,
+        support_reference=args.support_reference,
         arm_shift=arm_shift,
         shoulder_half_width=shoulder_half_width,
         arm_filter_sigma=args.arm_filter_sigma,
@@ -1022,6 +1072,9 @@ def main():
 
     def report(output_file, stats):
         rows[output_file.stem] = {"name": output_file.stem, **stats}
+        # Flush periodically so an interrupted long run keeps its stats for --skip_existing resumes.
+        if len(rows) % _MANIFEST_FLUSH_EVERY == 0:
+            _write_manifest(output_file.parent, rows)
         if args.debug:
             tqdm.write(
                 f"[g1_csv_to_gr2_npz] {output_file.name}: "
@@ -1029,7 +1082,7 @@ def main():
                 f"({stats['self_penetration_run_s']:.2f} s >= {_PENETRATION_REPORT} m), "
                 f"avoided={stats['avoided_frames']}/{stats['frames']}, "
                 f"hand_err={stats['mean_hand_error']:.4f}/{stats['max_hand_error']:.4f} m, "
-                f"foot_err={stats['mean_foot_error']:.4f} m, grounded={stats['grounded']}"
+                f"foot_err={stats['mean_foot_error']:.4f}/{stats['max_foot_error']:.4f} m, grounded={stats['grounded']}"
             )
 
     if args.workers <= 1:
