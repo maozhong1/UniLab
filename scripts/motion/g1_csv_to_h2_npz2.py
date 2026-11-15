@@ -41,6 +41,11 @@ Usage:
     uv run scripts/motion/g1_csv_to_h2_npz2.py --input <dir> --output <dir> --workers 10
     uv run scripts/motion/g1_csv_to_h2_npz2.py --input <dir> --output <dir> \
         --align_sole_center --foot_forward_extra 0.025   # standing CoM near mid-foot
+    # kneeling / crawling / ground contact: ground over every collision geom
+    uv run scripts/motion/g1_csv_to_h2_npz2.py --input <dir> --output <dir> --ground_all
+    # arm/body self-collision avoidance + torso-frame shoulders + smoothing + per-clip QC report
+    uv run scripts/motion/g1_csv_to_h2_npz2.py --input <dir> --output <dir> --self_collision \
+        --arm_torso_frame --smooth_sigma 1.5 --report report.csv
 """
 
 from __future__ import annotations
@@ -281,6 +286,92 @@ def _quat_error_world(q_target: np.ndarray, q_current: np.ndarray) -> np.ndarray
     return (angle / sin_half) * vec
 
 
+# Floor-contact groups for ground-contact clips (crawling, kneeling, lying): G1 collision bodies that count
+# as "touching the floor" -> the H2 body whose lowest collision point is then pinned to z = 0.
+_CONTACT_GROUPS: dict[str, tuple[tuple[str, ...], str, str]] = {
+    # group: (G1 bodies, H2 body carrying the contact geoms, H2 tracked IK body whose z row is released)
+    "pelvis": (("pelvis",), "pelvis", "pelvis"),
+    "torso": (("torso_link",), "torso_link", "torso_link"),
+    "left_knee": (("left_knee_link",), "left_knee_link", "left_knee_link"),
+    "right_knee": (("right_knee_link",), "right_knee_link", "right_knee_link"),
+    "left_foot": (("left_ankle_roll_link",), "left_ankle_pitch_link", "left_ankle_roll_link"),
+    "right_foot": (("right_ankle_roll_link",), "right_ankle_pitch_link", "right_ankle_roll_link"),
+    "left_elbow": (("left_elbow_link",), "left_elbow_link", "left_elbow_link"),
+    "right_elbow": (("right_elbow_link",), "right_elbow_link", "right_elbow_link"),
+    "left_hand": (("left_wrist_pitch_link", "left_wrist_yaw_link"), "left_wrist_yaw_link", "left_wrist_yaw_link"),
+    "right_hand": (("right_wrist_pitch_link", "right_wrist_yaw_link"), "right_wrist_yaw_link", "right_wrist_yaw_link"),
+}
+
+
+def _floor_geom(model: mujoco.MjModel) -> int:
+    return next(g for g in range(model.ngeom) if model.geom_type[g] == mujoco.mjtGeom.mjGEOM_PLANE)
+
+
+def _body_collision_geoms(model: mujoco.MjModel, body_names: tuple[str, ...]) -> list[int]:
+    ids = {mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, n) for n in body_names}
+    return [
+        g for g in range(model.ngeom)
+        if model.geom_contype[g] != 0 and model.geom_type[g] != mujoco.mjtGeom.mjGEOM_PLANE
+        and int(model.geom_bodyid[g]) in ids
+    ]
+
+
+class _FloorPins:
+    """IK rows that pin the lowest collision point of selected H2 bodies to the floor (z = 0)."""
+
+    def __init__(self, model: mujoco.MjModel):
+        self.model = model
+        self.floor = _floor_geom(model)
+        self.geoms = {
+            grp: _body_collision_geoms(model, (h2_body,)) for grp, (_g1, h2_body, _trk) in _CONTACT_GROUPS.items()
+        }
+        self.all_geoms = [
+            g for g in range(model.ngeom)
+            if model.geom_contype[g] != 0 and model.geom_type[g] != mujoco.mjtGeom.mjGEOM_PLANE
+            and model.geom_bodyid[g] > 0
+        ]
+        self._fromto = np.zeros(6)
+        self._jac = np.zeros((3, model.nv))
+
+    def avoid_rows(self, data: mujoco.MjData, weight: float, margin: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
+        """One-sided rows keeping every collision geom above the floor (height >= margin).
+
+        Without these the IK may bury a thick limb (H2 thighs are much thicker than G1's) and the later
+        rigid grounding lift then raises the whole body, floating the limbs that should touch the floor.
+        """
+        model = self.model
+        j_rows, e_rows = [], []
+        for g in self.all_geoms:
+            d = mujoco.mj_geomDistance(model, data, g, self.floor, margin, self._fromto)
+            if d >= margin:
+                continue
+            mujoco.mj_jac(model, data, self._jac, None, self._fromto[:3].copy(), int(model.geom_bodyid[g]))
+            j_rows.append(weight * self._jac[2].copy())
+            e_rows.append(weight * (margin - d))
+        if not j_rows:
+            return np.zeros((0, model.nv)), np.zeros(0)
+        return np.stack(j_rows), np.asarray(e_rows)
+
+    def rows(self, data: mujoco.MjData, groups: set[str], weight: float) -> tuple[np.ndarray, np.ndarray]:
+        model = self.model
+        j_rows, e_rows = [], []
+        for grp in groups:
+            best = None
+            for g in self.geoms[grp]:
+                d = mujoco.mj_geomDistance(model, data, g, self.floor, 0.5, self._fromto)
+                if best is None or d < best[0]:
+                    best = (d, g, self._fromto[:3].copy())
+            if best is None:
+                continue
+            d, g, point = best
+            mujoco.mj_jac(model, data, self._jac, None, point, int(model.geom_bodyid[g]))
+            j_rows.append(weight * self._jac[2].copy())
+            e_rows.append(weight * (0.0 - d))  # drive the height above the floor to zero
+        if not j_rows:
+            return np.zeros((0, model.nv)), np.zeros(0)
+        return np.stack(j_rows), np.asarray(e_rows)
+
+
 class _SourceFK:
     """G1 forward kinematics: inject a CSV pose, read tracked-body world poses."""
 
@@ -289,6 +380,21 @@ class _SourceFK:
         self.data = mujoco.MjData(self.model)
         self.inj = _map_csv_joints(self.model, joint_names)
         self.body_ids = _body_ids(self.model, _TRACKED_BODIES)
+        self.floor = _floor_geom(self.model)
+        self.contact_geoms = {
+            grp: _body_collision_geoms(self.model, g1_bodies) for grp, (g1_bodies, _h, _t) in _CONTACT_GROUPS.items()
+        }
+        self._fromto = np.zeros(6)
+
+    def contact_groups(self, thr: float) -> set[str]:
+        """Groups whose lowest G1 collision geom is within ``thr`` of the floor (call after ``poses``)."""
+        out: set[str] = set()
+        for grp, geoms in self.contact_geoms.items():
+            for g in geoms:
+                if mujoco.mj_geomDistance(self.model, self.data, g, self.floor, thr, self._fromto) < thr:
+                    out.add(grp)
+                    break
+        return out
 
     def poses(self, root_pos, root_quat, dof_pos) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         d = self.data
@@ -310,6 +416,7 @@ def _build_targets(
     foot_offset: float,
     arm_scale: float,
     foot_forward: float = 0.0,
+    shoulder_local: dict[str, np.ndarray] | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     """Scale G1 body world poses into contact-preserving H2 targets.
 
@@ -340,9 +447,18 @@ def _build_targets(
     # Re-target distal arm bodies as a full-3D offset from their (already-scaled) shoulder
     # target, scaled by the arm-length ratio. The shoulder sits near the torso and keeps its
     # leg/pelvis-scaled target; only the arm's internal reach is rescaled.
+    tgt_quat = {name: g1_quat[name].copy() for name in _ORI_WEIGHTS}
+    if shoulder_local is not None:
+        # The shoulder_roll links are rigid with the torso: put their targets at H2's own fixed torso-frame
+        # offset (rotated by the target torso orientation) instead of the leg-ratio scaled G1 offset, which
+        # H2 cannot reach and which skews the hand targets of every arm clip.
+        rot = np.empty(9)
+        mujoco.mju_quat2Mat(rot, tgt_quat[_TORSO_BODY])
+        rot = rot.reshape(3, 3)
+        for name, local in shoulder_local.items():
+            tgt_pos[name] = tgt_pos[_TORSO_BODY] + rot @ local
     for name, shoulder in _ARM_SHOULDER.items():
         tgt_pos[name] = tgt_pos[shoulder] + (g1_pos[name] - g1_pos[shoulder]) * arm_scale
-    tgt_quat = {name: g1_quat[name].copy() for name in _ORI_WEIGHTS}
     if foot_forward != 0.0:
         rot = np.empty(9)
         heading = np.zeros(2)
@@ -357,6 +473,131 @@ def _build_targets(
             for name in _FOOT_BODIES:
                 tgt_pos[name][:2] += foot_forward * heading / norm
     return tgt_pos, tgt_quat
+
+
+def _shoulder_local(model_file: str) -> dict[str, np.ndarray]:
+    """Fixed torso-frame offset of each shoulder_roll link at the nominal pose (cold path).
+
+    The shoulder_pitch/roll joint axes intersect, so ``*_shoulder_roll_link`` is rigid with the torso.
+    """
+    model = mujoco.MjModel.from_xml_path(model_file)
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    ids = _body_ids(model, ("torso_link", "left_shoulder_roll_link", "right_shoulder_roll_link"))
+    rot = data.xmat[ids["torso_link"]].reshape(3, 3)
+    return {
+        name: rot.T @ (data.xpos[ids[name]] - data.xpos[ids["torso_link"]])
+        for name in ("left_shoulder_roll_link", "right_shoulder_roll_link")
+    }
+
+
+class _SelfCollision:
+    """Self-collision pairs of the H2 collision geoms, for IK avoidance rows and penetration QC.
+
+    The H2 collision geoms are ``contype=1 conaffinity=0`` (floor only), so MuJoCo never reports
+    self-contacts; distances are queried explicitly with ``mj_geomDistance``. Pairs of the same body,
+    parent/child bodies and sibling bodies are skipped (kinematic neighbours overlap by design).
+    """
+
+    def __init__(self, model: mujoco.MjModel, margin: float = 0.015):
+        self.model = model
+        self.margin = margin
+        geoms = [
+            g for g in range(model.ngeom)
+            if model.geom_contype[g] != 0
+            and model.geom_type[g] != mujoco.mjtGeom.mjGEOM_PLANE
+            and model.geom_bodyid[g] > 0
+        ]
+
+        def neighbours(a: int, b: int) -> bool:
+            pa, pb = model.body_parentid[a], model.body_parentid[b]
+            return a == b or pa == b or pb == a or pa == pb
+
+        pairs = [
+            (a, b) for i, a in enumerate(geoms) for b in geoms[i + 1:]
+            if not neighbours(int(model.geom_bodyid[a]), int(model.geom_bodyid[b]))
+        ]
+        self.ga = np.array([p[0] for p in pairs], dtype=np.int64)
+        self.gb = np.array([p[1] for p in pairs], dtype=np.int64)
+        self.rbound = model.geom_rbound.copy()
+        self._fromto = np.zeros(6)
+        self._jac1 = np.zeros((3, model.nv))
+        self._jac2 = np.zeros((3, model.nv))
+
+    def _candidates(self, data: mujoco.MjData, margin: float) -> np.ndarray:
+        """Indices of pairs whose bounding spheres are closer than ``margin`` (cheap prefilter)."""
+        centre_gap = np.linalg.norm(data.geom_xpos[self.ga] - data.geom_xpos[self.gb], axis=1)
+        return np.nonzero(centre_gap - self.rbound[self.ga] - self.rbound[self.gb] < margin)[0]
+
+    def worst_penetration(self, data: mujoco.MjData) -> float:
+        """Deepest self-penetration (m, >= 0) at the current kinematics (mj_kinematics must have run)."""
+        worst = 0.0
+        for k in self._candidates(data, 0.0):
+            d = mujoco.mj_geomDistance(self.model, data, int(self.ga[k]), int(self.gb[k]), 0.0, self._fromto)
+            worst = max(worst, -d)
+        return worst
+
+    def rows(self, data: mujoco.MjData, weight: float) -> tuple[np.ndarray, np.ndarray]:
+        """Linearised separation rows (J, e): J dq >= margin - dist for every pair closer than margin."""
+        model = self.model
+        j_rows: list[np.ndarray] = []
+        e_rows: list[float] = []
+        for k in self._candidates(data, self.margin):
+            a, b = int(self.ga[k]), int(self.gb[k])
+            dist = mujoco.mj_geomDistance(model, data, a, b, self.margin, self._fromto)
+            if dist >= self.margin:
+                continue
+            p1, p2 = self._fromto[:3].copy(), self._fromto[3:].copy()
+            n = p2 - p1
+            norm = float(np.linalg.norm(n))
+            centre_dir = data.geom_xpos[b] - data.geom_xpos[a]
+            if norm < 1e-9:
+                n = centre_dir
+                norm = float(np.linalg.norm(n))
+                if norm < 1e-9:
+                    continue
+            n = n / norm
+            if n @ centre_dir < 0.0:  # penetrating pairs return the segment reversed
+                n = -n
+            mujoco.mj_jac(model, data, self._jac1, None, p1, int(model.geom_bodyid[a]))
+            mujoco.mj_jac(model, data, self._jac2, None, p2, int(model.geom_bodyid[b]))
+            j_rows.append(weight * (n @ (self._jac2 - self._jac1)))
+            e_rows.append(weight * (self.margin - dist))
+        if not j_rows:
+            return np.zeros((0, model.nv)), np.zeros(0)
+        return np.stack(j_rows), np.asarray(e_rows)
+
+
+def _gaussian_smooth(x: np.ndarray, sigma: float) -> np.ndarray:
+    """Zero-phase Gaussian smoothing along axis 0 with reflected edges (sigma in frames)."""
+    if sigma <= 0.0 or x.shape[0] < 5:
+        return x
+    half = max(1, int(np.ceil(3.0 * sigma)))
+    t = np.arange(-half, half + 1)
+    kernel = np.exp(-0.5 * (t / sigma) ** 2)
+    kernel /= kernel.sum()
+    pad = min(half, x.shape[0] - 1)
+    padded = np.concatenate([x[pad:0:-1], x, x[-2:-pad - 2:-1]], axis=0)
+    out = np.empty_like(x)
+    flat_in = padded.reshape(padded.shape[0], -1)
+    flat_out = out.reshape(out.shape[0], -1)
+    for c in range(flat_in.shape[1]):
+        flat_out[:, c] = np.convolve(flat_in[:, c], kernel, mode="same")[pad:pad + x.shape[0]]
+    return out
+
+
+def _smooth_trajectory(qpos: np.ndarray, hinge_qadr: list[int], sigma: float) -> np.ndarray:
+    """Smooth root position, root orientation and hinge angles of an IK trajectory."""
+    out = qpos.copy()
+    out[:, 0:3] = _gaussian_smooth(qpos[:, 0:3], sigma)
+    quat = qpos[:, 3:7].copy()
+    for i in range(1, len(quat)):  # sign continuity so the components can be averaged
+        if quat[i] @ quat[i - 1] < 0.0:
+            quat[i] = -quat[i]
+    quat = _gaussian_smooth(quat, sigma)
+    out[:, 3:7] = quat / np.linalg.norm(quat, axis=1, keepdims=True)
+    out[:, hinge_qadr] = _gaussian_smooth(qpos[:, hinge_qadr], sigma)
+    return out
 
 
 def _smooth_ground_lift(raw_lift: np.ndarray, window: int) -> np.ndarray:
@@ -422,8 +663,15 @@ class _H2Ik:
         tgt_quat: dict[str, np.ndarray],
         posture_bias: np.ndarray,
         iters: int,
+        selfcol: "_SelfCollision | None" = None,
+        selfcol_weight: float = 6.0,
+        pins: "_FloorPins | None" = None,
+        pinned: "set[str] | None" = None,
+        pin_weight: float = 20.0,
+        floor_avoid: bool = False,
     ) -> None:
         model, data = self.model, self.data
+        released = {_CONTACT_GROUPS[g][2] for g in pinned} if (pins is not None and pinned) else set()
         n_pos = len(_POS_WEIGHTS)
         n_ori = len(_ORI_WEIGHTS)
         n_post = len(self.hinges)
@@ -439,6 +687,9 @@ class _H2Ik:
                 mujoco.mj_jacBody(model, data, self._jacp, self._jacr, bid)
                 J[r:r + 3] = w * self._jacp
                 e[r:r + 3] = w * (tgt_pos[name] - data.xpos[bid])
+                if name in released:  # floor contact decides the height of a pinned body, not the scaled target
+                    J[r + 2] = 0.0
+                    e[r + 2] = 0.0
                 r += 3
             for name, w in _ORI_WEIGHTS.items():
                 bid = self.ori_body_ids[name]
@@ -451,10 +702,28 @@ class _H2Ik:
                 J[r, va] = self.posture_w
                 e[r] = self.posture_w * (posture_bias[k] - data.qpos[qa])
                 r += 1
+            J_all, e_all = J, e
+            if pins is not None and pinned is not None:
+                if pinned:
+                    p_j, p_e = pins.rows(data, pinned, pin_weight)
+                    if len(p_e):
+                        J_all = np.vstack([J_all, p_j])
+                        e_all = np.concatenate([e_all, p_e])
+                if floor_avoid:
+                    a_j, a_e = pins.avoid_rows(data, pin_weight)
+                    if len(a_e):
+                        J_all = np.vstack([J_all, a_j])
+                        e_all = np.concatenate([e_all, a_e])
+            if selfcol is not None:
+                # geom_xpos is up to date after mj_kinematics; add separation rows for close pairs
+                sc_j, sc_e = selfcol.rows(data, selfcol_weight)
+                if len(sc_e):
+                    J_all = np.vstack([J_all, sc_j])
+                    e_all = np.concatenate([e_all, sc_e])
             # damped least squares: dq = (JtJ + lambda^2 I)^-1 Jt e
-            JtJ = J.T @ J
+            JtJ = J_all.T @ J_all
             JtJ[np.diag_indices_from(JtJ)] += self.damping ** 2
-            dq = np.linalg.solve(JtJ, J.T @ e)
+            dq = np.linalg.solve(JtJ, J_all.T @ e_all)
             mujoco.mj_integratePos(model, data.qpos, dq, 1.0)
             self._clamp_hinges()
 
@@ -478,6 +747,16 @@ def run_h2_ik_export(
     ground_smooth: int = 5,
     legacy_foot_ori: bool = False,
     foot_forward: float = 0.0,
+    ground_all: bool = False,
+    self_collision: bool = False,
+    selfcol_weight: float = 6.0,
+    selfcol_margin: float = 0.015,
+    shoulder_local: dict[str, np.ndarray] | None = None,
+    smooth_sigma: float = 0.0,
+    want_report: bool = False,
+    contact_pin: bool = False,
+    contact_thr: float = 0.03,
+    contact_weight: float = 20.0,
     progress: bool = True,
 ) -> dict[str, float]:
     tmp_model_path, _, _ = inject_mujoco_tracking_sensors(h2_model_file)
@@ -489,11 +768,15 @@ def run_h2_ik_export(
 
     # Foot contact geoms (the condim mesh copies on ankle_*; contype!=0). Used by the
     # grounding pass to project any floor penetration out of each solved frame.
+    # With ``ground_all`` every collision geom counts (knees, shins, hands, torso ...), which is
+    # needed for kneeling / crawling / ground-contact clips where feet are not the lowest part.
     foot_contact_geoms = {
         g for g in range(model.ngeom)
         if model.geom_contype[g] != 0
-        and (bn := mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[g]))
-        and "ankle" in bn
+        and model.geom_type[g] != mujoco.mjtGeom.mjGEOM_PLANE
+        and (ground_all or (
+            (bn := mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[g]))
+            and "ankle" in bn))
     }
 
     inj = _map_csv_joints(model, list(loader.joint_names))       # 29 CSV joints -> H2 addrs
@@ -506,6 +789,12 @@ def run_h2_ik_export(
         model, data, damping=damping, posture_w=posture_w,
         ori_bodies=_ORI_H2_BODY_LEGACY if legacy_foot_ori else _ORI_H2_BODY,
     )
+    selfcol = _SelfCollision(model, margin=selfcol_margin) if (self_collision or want_report) else None
+    floor_pins = _FloorPins(model) if contact_pin else None
+    track_stats = debug or want_report
+    foot_err_max = 0.0
+    hand_err_max = 0.0
+    hand_err_frames = 0
 
     # --- pass 1: solve H2 qpos per frame (warm-started from the previous solution) ---
     qpos_traj = np.zeros((num_frames, model.nq), dtype=np.float64)
@@ -519,7 +808,8 @@ def run_h2_ik_export(
             loader.motion_base_poss[i], loader.motion_base_rots[i], loader.motion_dof_poss[i]
         )
         tgt_pos, tgt_quat = _build_targets(
-            g1_pos, g1_quat, h_scale, v_scale, foot_offset, arm_scale, foot_forward
+            g1_pos, g1_quat, h_scale, v_scale, foot_offset, arm_scale, foot_forward,
+            shoulder_local=shoulder_local,
         )
         # naive G1-name copy = posture bias for redundant DoFs (0 for H2-only head joints)
         bias = np.zeros(num_joints)
@@ -532,14 +822,35 @@ def run_h2_ik_export(
         if i == 0:
             data.qpos[0:3] = tgt_pos[_ANCHOR_BODY]
             data.qpos[3:7] = tgt_quat[_ANCHOR_BODY]
-        ik.solve(tgt_pos, tgt_quat, bias, iters=warm_iters if i == 0 else iters)
+        ik.solve(
+            tgt_pos, tgt_quat, bias, iters=warm_iters if i == 0 else iters,
+            selfcol=selfcol if self_collision else None, selfcol_weight=selfcol_weight,
+            pins=floor_pins, pinned=source.contact_groups(contact_thr) if contact_pin else None,
+            pin_weight=contact_weight, floor_avoid=contact_pin,
+        )
         qpos_traj[i] = data.qpos.copy()
+        if track_stats:
+            mujoco.mj_kinematics(model, data)  # solve() ends on an integration step; refresh xpos
+            f_err = max(
+                float(np.linalg.norm(tgt_pos[n] - data.xpos[ik.body_ids[n]])) for n in _FOOT_BODIES
+            )
+            h_err = max(
+                float(np.linalg.norm(tgt_pos[n] - data.xpos[ik.body_ids[n]]))
+                for n in ("left_wrist_yaw_link", "right_wrist_yaw_link")
+            )
+            foot_err_max = max(foot_err_max, f_err)
+            hand_err_max = max(hand_err_max, h_err)
+            hand_err_frames += int(h_err > 0.08)
         if debug:
             err_accum += float(np.linalg.norm(tgt_pos["left_ankle_roll_link"] - data.xpos[ik.body_ids["left_ankle_roll_link"]]))
             arm_err_accum += 0.5 * (
                 float(np.linalg.norm(tgt_pos["left_wrist_yaw_link"] - data.xpos[ik.body_ids["left_wrist_yaw_link"]]))
                 + float(np.linalg.norm(tgt_pos["right_wrist_yaw_link"] - data.xpos[ik.body_ids["right_wrist_yaw_link"]]))
             )
+
+    # --- optional temporal smoothing of the IK trajectory (before grounding, which re-fixes the floor) ---
+    if smooth_sigma > 0.0:
+        qpos_traj = _smooth_trajectory(qpos_traj, [qa for qa, _va in readback], smooth_sigma)
 
     # --- grounding pass: project floor penetration out of each frame ---
     # The IK targets the ankle-*origin* height, not the sole contact point, so a pitched
@@ -560,6 +871,9 @@ def run_h2_ik_export(
             for c in range(data.ncon):
                 con = data.contact[c]
                 if con.geom1 in foot_contact_geoms or con.geom2 in foot_contact_geoms:
+                    other = con.geom2 if con.geom1 in foot_contact_geoms else con.geom1
+                    if model.geom_type[other] != mujoco.mjtGeom.mjGEOM_PLANE:
+                        continue  # self-collision pair, not a floor contact
                     pen = min(pen, float(con.dist))  # most-negative = deepest penetration
             if pen < -ground_tol:
                 raw_lift[i] = -pen  # rigid vertical lift so deepest sole -> z=0
@@ -589,10 +903,16 @@ def run_h2_ik_export(
     body_lin_vel_w = np.zeros((num_frames, num_bodies, 3), dtype=np.float32)
     body_ang_vel_w = np.zeros((num_frames, num_bodies, 3), dtype=np.float32)
 
+    selfpen_max = 0.0
+    selfpen_frames = 0
     for i in range(num_frames):
         data.qpos[:] = qpos_traj[i]
         data.qvel[:] = qvel_traj[i]
         mujoco.mj_forward(model, data)
+        if want_report:
+            pen = selfcol.worst_penetration(data)
+            selfpen_max = max(selfpen_max, pen)
+            selfpen_frames += int(pen > 0.01)
         for k, (qa, va) in enumerate(readback):
             joint_pos[i, k] = data.qpos[qa]
             joint_vel[i, k] = data.qvel[va]
@@ -625,10 +945,22 @@ def run_h2_ik_export(
             body_ang_vel_w=body_ang_vel_w,
         )
     os.replace(partial_file, output_file)
-    return {
+    stats = {
         "mean_foot_err": err_accum / max(num_frames, 1) if debug else float("nan"),
         "mean_arm_err": arm_err_accum / max(num_frames, 1) if debug else float("nan"),
     }
+    if want_report:
+        stats.update({
+            "frames": num_frames,
+            "selfpen_max_m": selfpen_max,
+            "selfpen_frac_gt1cm": selfpen_frames / max(num_frames, 1),
+            "foot_err_max_m": foot_err_max,
+            "hand_err_max_m": hand_err_max,
+            "hand_err_frac_gt8cm": hand_err_frames / max(num_frames, 1),
+            "joint_vel_p99": float(np.percentile(np.abs(joint_vel), 99)),
+            "root_lin_vel_max": float(np.abs(body_lin_vel_w[:, 1]).max()),
+        })
+    return stats
 
 
 def _convert_clip(
@@ -669,6 +1001,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ground_tol", type=float, default=0.0, help="allowed foot penetration (m) before lifting")
     p.add_argument("--ground_smooth", type=int, default=5,
                    help="temporal window (frames) to smooth the grounding lift (1=off, per-frame)")
+    p.add_argument("--ground_all", action="store_true",
+                   help="grounding pass uses every collision geom (kneeling/crawl), not just the feet")
+    p.add_argument("--self_collision", action="store_true",
+                   help="add self-collision avoidance rows (arms vs body / other arm / legs) to the IK")
+    p.add_argument("--self_collision_weight", type=float, default=6.0, help="weight of the avoidance rows")
+    p.add_argument("--self_collision_margin", type=float, default=0.015,
+                   help="clearance (m) the avoidance rows try to keep between collision geoms")
+    p.add_argument("--contact_pin", action="store_true",
+                   help="ground-contact clips (crawl/kneel/lying): pin the lowest point of every H2 body that "
+                        "touches the floor in the G1 source to z=0 (fixes floating knees/feet)")
+    p.add_argument("--contact_thr", type=float, default=0.03, help="G1 geom-to-floor distance (m) counted as contact")
+    p.add_argument("--contact_weight", type=float, default=20.0, help="weight of the floor-pin rows")
+    p.add_argument("--arm_torso_frame", action="store_true",
+                   help="shoulder targets at H2's fixed torso-frame offset instead of the leg-ratio scaled G1 offset")
+    p.add_argument("--smooth_sigma", type=float, default=0.0,
+                   help="Gaussian smoothing (frames, 0=off) of root + hinge trajectories before grounding")
+    p.add_argument("--report", type=str, default="",
+                   help="write per-clip QC stats (self-penetration, IK residual, joint-velocity p99) to this CSV")
     p.add_argument("--legacy_foot_ori", action="store_true",
                    help="match foot orientation on H2 ankle_roll_link (old, incorrect behaviour)")
     p.add_argument("--align_sole_center", action="store_true",
@@ -730,6 +1080,12 @@ def main() -> None:
         warm_iters=args.warm_iters, debug=args.debug, ground=not args.no_ground,
         ground_tol=args.ground_tol, ground_smooth=args.ground_smooth,
         legacy_foot_ori=args.legacy_foot_ori, foot_forward=foot_forward,
+        ground_all=args.ground_all,
+        self_collision=args.self_collision, selfcol_weight=args.self_collision_weight,
+        selfcol_margin=args.self_collision_margin,
+        shoulder_local=_shoulder_local(args.h2_model_xml) if args.arm_torso_frame else None,
+        smooth_sigma=args.smooth_sigma, want_report=bool(args.report),
+        contact_pin=args.contact_pin, contact_thr=args.contact_thr, contact_weight=args.contact_weight,
     )
     loader_kwargs = dict(
         input_fps=int(args.input_fps), output_fps=int(args.output_fps),
@@ -748,7 +1104,11 @@ def main() -> None:
         else:
             jobs.append((csv_file, output_file))
 
+    report_rows: list[dict] = []
+
     def report(output_file: Path, stats: dict[str, float]) -> None:
+        if args.report:
+            report_rows.append({"name": output_file.name.removesuffix(".npz"), **stats})
         if args.debug:
             tqdm.write(f"[g1_csv_to_h2_npz2] {output_file.name}: "
                        f"mean_foot_err={stats['mean_foot_err']:.4f} m  "
@@ -780,6 +1140,17 @@ def main() -> None:
                 except Exception as exc:  # keep going on a bad clip
                     failures.append((csv_file, str(exc)))
                     tqdm.write(f"[g1_csv_to_h2_npz2] FAILED {csv_file.name}: {exc}")
+
+    if args.report and report_rows:
+        import csv as _csv
+
+        report_path = Path(args.report).expanduser()
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(report_path, "w", newline="") as handle:
+            writer = _csv.DictWriter(handle, fieldnames=list(report_rows[0]))
+            writer.writeheader()
+            writer.writerows(sorted(report_rows, key=lambda r: r["name"]))
+        print(f"[g1_csv_to_h2_npz2] QC report ({len(report_rows)} clips) -> {report_path}")
 
     ok = len(csv_files) - len(failures) - skipped
     print(f"[g1_csv_to_h2_npz2] done: {ok}/{len(csv_files)} converted -> {output_files[0].parent}")
