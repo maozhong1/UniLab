@@ -338,12 +338,15 @@ class GR2SonicMotionTrackingEnv(MotionTrackingEnv):
         R, F = frames.shape[0], self._F
         offsets = np.arange(F, dtype=np.int32) * self._stride
         idx = np.minimum(frames[:, None] + offsets[None, :], clip_end[:, None])
-        md = self.motion_loader.get_motion_at_frame(idx.reshape(-1))
-        jp = md.joint_pos.reshape(R, F, -1)
-        jv = md.joint_vel.reshape(R, F, -1)
-        bp = md.body_pos_w.reshape(R, F, -1, 3)
-        bq = md.body_quat_w.reshape(R, F, -1, 4)
-        return jp, jv, bp, bq
+        jp, jv, bp, bq = self.motion_loader.get_joint_and_body_at_frame(
+            idx.reshape(-1), self.anchor_body_idx
+        )
+        return (
+            jp.reshape(R, F, -1),
+            jv.reshape(R, F, -1),
+            bp.reshape(R, F, 3),
+            bq.reshape(R, F, 4),
+        )
 
     def _build_sonic_actor(
         self, info: dict, dof_pos: np.ndarray, dof_vel: np.ndarray, gyro: np.ndarray,
@@ -362,8 +365,8 @@ class GR2SonicMotionTrackingEnv(MotionTrackingEnv):
         robot_anchor_quat = robot_body_quat_w[:, ai]
         src_pos = np.repeat(robot_anchor_pos, F, axis=0)
         src_quat = np.repeat(robot_anchor_quat, F, axis=0)
-        tgt_pos = fut_bp[:, :, ai].reshape(R * F, 3)
-        tgt_quat = fut_bq[:, :, ai].reshape(R * F, 4)
+        tgt_pos = fut_bp.reshape(R * F, 3)
+        tgt_quat = fut_bq.reshape(R * F, 4)
         out_pos = np.empty((R * F, 3), dtype=dtype)
         out_rot6 = np.empty((R * F, 6), dtype=dtype)
         np_write_relative_anchor_transform_pos_rot6d(

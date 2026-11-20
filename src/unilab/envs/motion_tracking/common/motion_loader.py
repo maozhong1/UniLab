@@ -3,13 +3,62 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 
 from unilab.assets.hub import resolve_motion_files
+
+
+# Threaded gather: ``np.take`` releases the GIL, so large gathers scale across cores.
+_GATHER_MIN_ROWS = 8192
+_GATHER_THREADS = int(
+    os.environ.get("UNILAB_GATHER_THREADS", max(1, min(8, (os.cpu_count() or 1) // 2)))
+)
+_gather_pool: ThreadPoolExecutor | None = None
+
+
+def _get_gather_pool() -> ThreadPoolExecutor:
+    global _gather_pool
+    if _gather_pool is None:
+        _gather_pool = ThreadPoolExecutor(
+            max_workers=_GATHER_THREADS, thread_name_prefix="motion-gather"
+        )
+    return _gather_pool
+
+
+def _take_rows(src: np.ndarray, idx: np.ndarray, out: np.ndarray) -> None:
+    # np.take copies a non-contiguous ``src`` in full on every call; use fancy indexing there.
+    if src.flags.c_contiguous:
+        np.take(src, idx, axis=0, out=out)
+    else:
+        out[...] = src[idx]
+
+
+def threaded_take(jobs: Sequence[tuple[np.ndarray, np.ndarray, np.ndarray]]) -> None:
+    """Run ``out[:] = src[idx]`` for each ``(src, idx, out)`` job, chunked over rows.
+
+    Results are bit-identical to ``np.take(src, idx, axis=0, out=out)``. Small
+    gathers run inline to avoid thread overhead.
+    """
+    n = int(jobs[0][1].shape[0])
+    if _GATHER_THREADS <= 1 or n < _GATHER_MIN_ROWS:
+        for src, idx, out in jobs:
+            _take_rows(src, idx, out)
+        return
+    chunk = -(-n // _GATHER_THREADS)
+    pool = _get_gather_pool()
+    futures = [
+        pool.submit(_take_rows, src, idx[lo : lo + chunk], out[lo : lo + chunk])
+        for src, idx, out in jobs
+        for lo in range(0, n, chunk)
+    ]
+    for f in futures:
+        f.result()
 
 
 @dataclass
@@ -181,23 +230,50 @@ class MotionLoader:
         Returns:
             MotionData at specified frames
         """
-        if out is not None:
-            np.take(self.joint_pos, frame_idx, axis=0, out=out.joint_pos)
-            np.take(self.joint_vel, frame_idx, axis=0, out=out.joint_vel)
-            np.take(self.body_pos_w, frame_idx, axis=0, out=out.body_pos_w)
-            np.take(self.body_quat_w, frame_idx, axis=0, out=out.body_quat_w)
-            np.take(self.body_lin_vel_w, frame_idx, axis=0, out=out.body_lin_vel_w)
-            np.take(self.body_ang_vel_w, frame_idx, axis=0, out=out.body_ang_vel_w)
-            return out
-
-        return MotionData(
-            joint_pos=self.joint_pos[frame_idx],
-            joint_vel=self.joint_vel[frame_idx],
-            body_pos_w=self.body_pos_w[frame_idx],
-            body_quat_w=self.body_quat_w[frame_idx],
-            body_lin_vel_w=self.body_lin_vel_w[frame_idx],
-            body_ang_vel_w=self.body_ang_vel_w[frame_idx],
+        if out is None:
+            out = self.make_motion_data_buffer(int(frame_idx.shape[0]))
+        threaded_take(
+            [
+                (self.joint_pos, frame_idx, out.joint_pos),
+                (self.joint_vel, frame_idx, out.joint_vel),
+                (self.body_pos_w, frame_idx, out.body_pos_w),
+                (self.body_quat_w, frame_idx, out.body_quat_w),
+                (self.body_lin_vel_w, frame_idx, out.body_lin_vel_w),
+                (self.body_ang_vel_w, frame_idx, out.body_ang_vel_w),
+            ]
         )
+        return out
+
+    def get_joint_and_body_at_frame(
+        self, frame_idx: np.ndarray, body_idx: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Gather only joint pos/vel plus one body's pos/quat (no velocities, no other bodies).
+
+        Returns ``(joint_pos (N,J), joint_vel (N,J), body_pos (N,3), body_quat (N,4))``,
+        equal to the matching slices of :meth:`get_motion_at_frame`.
+        """
+        n = int(frame_idx.shape[0])
+        jp = np.empty((n, self.num_joints), dtype=self.joint_pos.dtype)
+        jv = np.empty((n, self.num_joints), dtype=self.joint_vel.dtype)
+        bp = np.empty((n, 3), dtype=self.body_pos_w.dtype)
+        bq = np.empty((n, 4), dtype=self.body_quat_w.dtype)
+        threaded_take(
+            [
+                (self.joint_pos, frame_idx, jp),
+                (self.joint_vel, frame_idx, jv),
+                (self._anchor_view(self.body_pos_w, body_idx), frame_idx, bp),
+                (self._anchor_view(self.body_quat_w, body_idx), frame_idx, bq),
+            ]
+        )
+        return jp, jv, bp, bq
+
+    def _anchor_view(self, arr: np.ndarray, body_idx: int) -> np.ndarray:
+        """Contiguous (num_frames, C) copy of one body's slice, cached (cold path on first use)."""
+        cache = self.__dict__.setdefault("_anchor_cache", {})
+        key = (id(arr), body_idx)
+        if key not in cache:
+            cache[key] = np.ascontiguousarray(arr[:, body_idx])
+        return cache[key]
 
 
 class MotionSampler:

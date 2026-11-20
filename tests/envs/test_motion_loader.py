@@ -230,3 +230,34 @@ def test_box_motion_loader_rejects_multi_clip_object_presence_mismatch(tmp_path)
 
     with np.testing.assert_raises(ValueError):
         BoxMotionLoader([str(motion_without_object), str(motion_with_object)])
+
+
+def test_threaded_gather_matches_fancy_indexing(tmp_path, monkeypatch):
+    from unilab.envs.motion_tracking.common import motion_loader as ml
+
+    rng = np.random.default_rng(0)
+    path = str(tmp_path / "m.npz")
+    nf, nj, nb = 300, 5, 7
+    np.savez(
+        path,
+        fps=np.array([50]),
+        joint_pos=rng.standard_normal((nf, nj), dtype=np.float32),
+        joint_vel=rng.standard_normal((nf, nj), dtype=np.float32),
+        body_pos_w=rng.standard_normal((nf, nb, 3), dtype=np.float32),
+        body_quat_w=rng.standard_normal((nf, nb, 4), dtype=np.float32),
+        body_lin_vel_w=rng.standard_normal((nf, nb, 3), dtype=np.float32),
+        body_ang_vel_w=rng.standard_normal((nf, nb, 3), dtype=np.float32),
+    )
+    loader = ml.MotionLoader(path)
+    monkeypatch.setattr(ml, "_GATHER_MIN_ROWS", 16)
+    monkeypatch.setattr(ml, "_GATHER_THREADS", 4)
+    idx = rng.integers(0, nf, 1001).astype(np.int32)
+
+    md = loader.get_motion_at_frame(idx)
+    np.testing.assert_array_equal(md.body_quat_w, loader.body_quat_w[idx])
+    np.testing.assert_array_equal(md.body_ang_vel_w, loader.body_ang_vel_w[idx])
+    jp, jv, bp, bq = loader.get_joint_and_body_at_frame(idx, 3)
+    np.testing.assert_array_equal(jp, loader.joint_pos[idx])
+    np.testing.assert_array_equal(jv, loader.joint_vel[idx])
+    np.testing.assert_array_equal(bp, loader.body_pos_w[idx, 3])
+    np.testing.assert_array_equal(bq, loader.body_quat_w[idx, 3])
