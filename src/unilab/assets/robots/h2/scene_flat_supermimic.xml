@@ -1,0 +1,7 @@
+<mujoco model="h2 flat scene (SuperMimic solver settings)">
+  <!-- Same robot and stand keyframe as scene_flat.xml, with the solver settings SuperMimic trains
+       with (mjlab MujocoCfg: pyramidal cone, impratio 1, 10 Newton / 20 line-search iterations).
+       The later <option> overrides the attributes set by h2.xml. -->
+  <include file="scene_flat.xml"/>
+  <option cone="pyramidal" impratio="1" iterations="10" ls_iterations="20"/>
+</mujoco>

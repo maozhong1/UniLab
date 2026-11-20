@@ -2,6 +2,7 @@
 
 __unilab_registry_modules__ = (
     "unilab.envs.motion_tracking.g1",
+    "unilab.envs.motion_tracking.h2",
     "unilab.envs.motion_tracking.x2",
 )
 
