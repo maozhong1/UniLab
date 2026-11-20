@@ -1,0 +1,23 @@
+# @package _global_
+# Unitree H2 (29 DoF) SuperMimic run on the BONES-SEED H2 retarget (5461 clips, ~11.5 h;
+# the name filter drops the prop-interaction clips). Matches the reference H2 command:
+#   sm-train --robot h2 --env.num-envs 4096 --policy-trainer.batch-size 2048 --schedule.total-iterations 50000
+training:
+  task_name: H2SuperMimic
+  sim_backend: mujoco
+
+algo:
+  num_envs: 4096
+  supermimic:
+    policy_trainer:
+      batch_size: 2048
+    schedule:
+      total_iterations: 50000
+      checkpoint_interval: 3000
+
+env:
+  motion_dirs:
+    - ~/work/sonic_vla_infer/bones-seed/selections/upright_nzp_h2_29dof_new
+    - ~/work/sonic_vla_infer/bones_seed_3k_new/npz_h2_29dof_new
+  motion_exclude_keywords: [table, _box_]
+  sampling_mode: return

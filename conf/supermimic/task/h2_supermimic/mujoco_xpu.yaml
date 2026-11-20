@@ -1,0 +1,29 @@
+# @package _global_
+# H2 SuperMimic run on an Intel XPU (torch 2.7.0+xpu, `make sync-xpu`, then `uv run --no-sync`).
+# Same data / schedule as h2_supermimic/mujoco; MLP matmuls in bf16 (XMX units, ~7x the fp32
+# matmul rate; world-model accuracy unchanged in an A/B fit) and torch.compile on the world-model
+# loss step and the imagination step.
+training:
+  task_name: H2SuperMimic
+  sim_backend: mujoco
+  device: xpu
+
+algo:
+  num_envs: 4096
+  supermimic:
+    mlp_dtype: bfloat16
+    wm_trainer:
+      compile: default
+    policy_trainer:
+      batch_size: 2048
+      compile: default
+    schedule:
+      total_iterations: 50000
+      checkpoint_interval: 3000
+
+env:
+  motion_dirs:
+    - ~/work/sonic_vla_infer/bones-seed/selections/upright_nzp_h2_29dof_new
+    - ~/work/sonic_vla_infer/bones_seed_3k_new/npz_h2_29dof_new
+  motion_exclude_keywords: [table, _box_]
+  sampling_mode: return
