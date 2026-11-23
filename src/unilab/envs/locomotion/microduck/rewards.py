@@ -414,6 +414,13 @@ def feet_flat_penalty(ctx: RewardContext, foot_tilt_xy: np.ndarray, contact: np.
     return np.asarray(np.sum(foot_tilt_xy * contact.astype(_dt()), axis=1), dtype=_dt())
 
 
+def neck_joint_pos_l2(ctx: RewardContext) -> np.ndarray:
+    """Penalise neck/head (idx 5-8) deviation from HOME (L2², ≥0). Keeps a
+    gradient back to HOME where the tight-std pose reward has saturated."""
+    diff = ctx.dof_pos[:, HEAD_SERVO_IDX] - ctx.default_angles[HEAD_SERVO_IDX]
+    return np.asarray(np.sum(np.square(diff), axis=1), dtype=_dt())
+
+
 def neck_action_rate_l2(ctx: RewardContext) -> np.ndarray:
     """Penalise neck/head (idx 5-8) action rate."""
     cur = ctx.info["current_actions"][:, 5:9]

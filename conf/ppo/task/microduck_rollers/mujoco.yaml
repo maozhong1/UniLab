@@ -48,12 +48,13 @@ reward:
     self_collisions: -1.0
     feet_flat: -2.0            # stance-blade flatness (contact-gated)
     neck_action_rate: -0.5
+    neck_joint_pos: -0.5       # neck/head L2 back to HOME (source neck_joint_pos_l2)
     joint_torques: -0.001
     action_over_limit: -0.5    # deter over-driving a joint past its stop
     hip_roll_neutral: -2.0     # pull hip_roll toward neutral (no splayed stance)
     gait_symmetry: -1.0        # balance L/R leg usage
   # kernel constants (source values; overridable)
-  upright_std: 0.2236
+  upright_std: 0.4472        # sqrt(0.2), mjlab velocity base
   com_height_min: 0.0935
   com_height_max: 0.1235
   wheel_vel_scale: 0.3

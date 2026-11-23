@@ -176,6 +176,13 @@ class MicroduckCommandRanges:
     # Fraction of resets forced to spin in place (twist xy=0, |vyaw| in the top band).
     turn_in_place_fraction: float = 0.0
     turn_in_place_min_frac: float = 0.4  # |vyaw| >= this * vyaw_max
+    # Fraction of samples forced forward (mjlab rel_forward_envs):
+    # vx = max(|vx|, forward_min_vx), vy = vyaw = 0.
+    forward_fraction: float = 0.0
+    forward_min_vx: float = 0.3
+    # Mid-episode command resampling period (s), drawn per env (mjlab
+    # resampling_time_range). None = sample once per episode at reset.
+    resampling_time_range: list[float] | None = None
 
 
 @dataclass
@@ -214,6 +221,8 @@ class MicroduckBaseCfg(LocomotionBaseCfg):
     max_tilt_deg: float = 60.0
     min_base_height: float = 0.06
     reset_base_qvel_limit: float = 0.5
+    # Absolute spawn base-z range (m). None = keyframe z.
+    reset_base_z_range: list[float] | None = None
 
     # Gait-phase clock init mode for foot-gait tasks (None = no clock; base tasks
     # unaffected). "offset_phase" = left/right seeded π apart (anti-phase stepping);
@@ -260,6 +269,10 @@ class MicroduckDRProvider(LocomotionDRProvider):
         kd = self._sample_scale(dr.randomize_bam_kd, dr.bam_kd_scale_range, n)
         act.set_gains(env_ids, kp_scale=kp, kd_scale=kd)
         act.reset(env_ids)  # zero the battery-sag torque memory
+        z_range = env.cfg.reset_base_z_range
+        if z_range is not None:
+            plan.qpos[:, 2] = self._rng.uniform(float(z_range[0]), float(z_range[1]), size=(n,))
+        env._reset_command_timers(env_ids)
         return plan
 
     def _sample_scale(self, enabled: bool, rng_range: list[float], n: int) -> np.ndarray:
@@ -314,6 +327,8 @@ class MicroduckBaseEnv(LocomotionBaseEnv):
     _reward_cfg: Any = None
 
     def __init__(self, cfg: MicroduckBaseCfg, num_envs: int = 1, backend_type: str = "mujoco"):
+        # Per-env seconds until the next command resample (resampling_time_range).
+        self._cmd_time_left = np.zeros((num_envs,), dtype=np.float32)
         backend = create_backend(
             backend_type,
             cfg.scene,
@@ -350,6 +365,12 @@ class MicroduckBaseEnv(LocomotionBaseEnv):
         )
         self._servo_vel_idx = np.asarray(
             self._backend.get_joint_dof_vel_indices(list(SERVO_NAMES))
+        )
+        # HOME by servo name: the shared base takes the keyframe's last 14 qpos,
+        # which is shifted on the roller model (passive wheels interleave).
+        # _servo_pos_idx indexes the base-excluded dof_pos (= qpos[7:]).
+        self.default_angles = np.asarray(
+            self._init_qpos[7:][self._servo_pos_idx], dtype=self.default_angles.dtype
         )
         self._bam_actuator.bind(self._backend)
         self._backend.set_pre_step_control(self._bam_actuator)
@@ -435,6 +456,11 @@ class MicroduckBaseEnv(LocomotionBaseEnv):
         twist_hi = np.asarray(cmd.twist_limit[1], dtype=np.float32)
         twist = rng.uniform(twist_lo, twist_hi, size=(num, NUM_TWIST)).astype(np.float32)
 
+        if cmd.forward_fraction > 0.0:
+            fwd = rng.uniform(size=(num,)) < min(cmd.forward_fraction, 1.0)
+            twist[fwd, 0] = np.maximum(np.abs(twist[fwd, 0]), cmd.forward_min_vx)
+            twist[fwd, 1:3] = 0.0
+
         if cmd.turn_in_place_fraction > 0.0:
             tip = rng.uniform(size=(num,)) < min(cmd.turn_in_place_fraction, 1.0)
             twist[tip, 0:2] = 0.0
@@ -451,6 +477,26 @@ class MicroduckBaseEnv(LocomotionBaseEnv):
             zero = rng.uniform(size=(num,)) < min(cmd.zero_command_prob, 1.0)
             block[zero] = 0.0  # exact idle: all slots → HOME target
         return block
+
+    def _draw_resample_time(self, num: int) -> np.ndarray:
+        lo, hi = self._cfg.commands.resampling_time_range  # type: ignore[misc]
+        return np.random.uniform(float(lo), float(hi), size=(num,)).astype(np.float32)
+
+    def _reset_command_timers(self, env_ids: np.ndarray) -> None:
+        if self._cfg.commands.resampling_time_range is not None:
+            self._cmd_time_left[env_ids] = self._draw_resample_time(len(env_ids))
+
+    def _resample_due_commands(self, info: dict) -> None:
+        """Count down per-env timers and resample the command block for the envs
+        that expired. Runs after the reward (scored on the old command) and before
+        the obs, like mjlab's command manager."""
+        if self._cfg.commands.resampling_time_range is None:
+            return
+        self._cmd_time_left -= self._cfg.ctrl_dt
+        due = np.flatnonzero(self._cmd_time_left <= 0.0)
+        if due.size:
+            info["commands"][due] = self._sample_command_block(due.size)
+            self._cmd_time_left[due] = self._draw_resample_time(due.size)
 
     @staticmethod
     def _sample_ranges(ranges: list[list[float]], num: int) -> np.ndarray:
@@ -475,6 +521,7 @@ class MicroduckBaseEnv(LocomotionBaseEnv):
         )
 
         reward = self._compute_reward(state.info, linvel, gyro, proj_grav, dof_pos, dof_vel)
+        self._resample_due_commands(state.info)
         obs = self._compute_obs(state.info, linvel, gyro, proj_grav, dof_pos, dof_vel)
         return state.replace(obs=obs, reward=reward, terminated=terminated)
 

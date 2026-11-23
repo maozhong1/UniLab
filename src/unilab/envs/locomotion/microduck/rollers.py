@@ -64,11 +64,15 @@ _STD_RUNNING = {r".*hip_yaw.*": 0.5, r".*hip_roll.*": 0.8, r".*hip_pitch.*": 0.8
 def _rollers_command_ranges() -> MicroduckCommandRanges:
     """Stride command: cmd_x in (-0.5, 0.6) (0=coast, >0=push, <0=brake); no yaw
     (heading held via reward, not commanded); head/body slots ZERO (roller policy
-    deploys with them zero-padded)."""
+    deploys with them zero-padded). Source twist cfg: 20% forward envs
+    (cmd_x >= 0.3), resampled every 3-8 s."""
     return MicroduckCommandRanges(
         twist_limit=[[-0.5, 0.0, 0.0], [0.6, 0.0, 0.0]],
         head_pose_ranges=[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
         body_pose_ranges=[[0.0, 0.0]] * 6,
+        forward_fraction=0.2,
+        forward_min_vx=0.3,
+        resampling_time_range=[3.0, 8.0],
     )
 
 
@@ -78,7 +82,7 @@ class MicroduckRollersRewardCfg:
     the rest are the source kernel constants (overridable in YAML)."""
 
     scales: dict[str, float]
-    upright_std: float = 0.2236
+    upright_std: float = 0.4472  # sqrt(0.2): mjlab velocity base (rollers keep it)
     # com height band (m)
     com_height_min: float = 0.0935
     com_height_max: float = 0.1235
@@ -130,6 +134,10 @@ class MicroduckRollersCfg(MicroduckBaseCfg):
     )
     commands: MicroduckCommandRanges = field(default_factory=_rollers_command_ranges)
     reward_config: MicroduckRollersRewardCfg | None = None
+    # Source reset_base: z ~ U(0.1335, 0.1435) absolute (tires 7 mm in → 3 mm
+    # clear; the STAND z=0.12 sinks them 2 cm), base at rest.
+    reset_base_z_range: list[float] | None = field(default_factory=lambda: [0.1335, 0.1435])
+    reset_base_qvel_limit: float = 0.0
     # gait_phase_init_mode stays None (clock-free).
 
 
@@ -185,6 +193,7 @@ class MicroduckRollersEnv(MicroduckBaseEnv):
             "self_collisions": lambda ctx: self._self_collision_count(),
             "feet_flat": lambda ctx: md_rewards.feet_flat_penalty(ctx, self._foot_tilt_xy(), self._foot_contact()),
             "neck_action_rate": md_rewards.neck_action_rate_l2,
+            "neck_joint_pos": md_rewards.neck_joint_pos_l2,
             "joint_torques": common_rewards.dof_torques_l2,
             "action_over_limit": lambda ctx: self._action_over_limit(ctx),
             "hip_roll_neutral": lambda ctx: common_rewards.joint_deviation_l1(ctx, HIP_ROLL_IDX),
