@@ -1,0 +1,40 @@
+# @package _global_
+# Fine-tune a finished h2_supermimic/mujoco_xpu run for 20k more iterations (50k -> 70k):
+#   scripts/supermimic/train_h2_xpu_nohup.sh task=h2_supermimic/mujoco_xpu_finetune \
+#       algo.resume=logs/supermimic/H2SuperMimic/<run>/ckpt_0050000.pt
+# - 1000 data-only iterations first, so the (empty after resume) replay buffer is refilled
+#   before the world model / policy / critic are updated again.
+# - LR warm restart: 3% -> 20% of the base LR over 2000 iterations, cosine back to 3% by ~66k,
+#   then constant.
+# - Dance clips (incl. macarena) sampled 3x as often on top of the return-based mixture.
+training:
+  task_name: H2SuperMimic
+  sim_backend: mujoco
+  device: xpu
+
+algo:
+  num_envs: 4096
+  supermimic:
+    mlp_dtype: bfloat16
+    wm_trainer:
+      compile: default
+    policy_trainer:
+      batch_size: 2048
+      compile: default
+    schedule:
+      total_iterations: 70000
+      checkpoint_interval: 2000
+      warmup_iterations: 1000
+      lr_restart_iteration: 50000
+      lr_restart_peak_ratio: 0.2
+      lr_restart_warmup_iterations: 2000
+
+env:
+  motion_dirs:
+    - ~/work/sonic_vla_infer/bones-seed/selections/upright_nzp_h2_29dof_new
+    - ~/work/sonic_vla_infer/bones_seed_3k_new/npz_h2_29dof_new
+  motion_exclude_keywords: [table, _box_]
+  sampling_mode: return
+  sampler:
+    boost_keywords: [dance]
+    boost_factor: 3.0
