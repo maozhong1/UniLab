@@ -38,6 +38,13 @@ class ScheduleCfg:
     log_interval: int = 50
     checkpoint_interval: int = 4000
     max_hours: float | None = None
+    # Optional LR restart for fine-tuning a resumed run: from iteration ``lr_restart_iteration`` the
+    # LR ramps linearly from ``lr_final_ratio`` to ``lr_restart_peak_ratio`` over
+    # ``lr_restart_warmup_iterations`` (counted from the first update after the restart), then
+    # decays by cosine back to ``lr_final_ratio`` over ``lr_decay_fraction`` of the remaining run.
+    lr_restart_iteration: int | None = None
+    lr_restart_peak_ratio: float = 0.2
+    lr_restart_warmup_iterations: int = 2000
 
 
 @dataclass
@@ -65,6 +72,24 @@ def cosine_lr(
     return base_lr * (
         final_ratio + (1.0 - final_ratio) * 0.5 * (1.0 + math.cos(math.pi * step / decay_steps))
     )
+
+
+def scheduled_lr(step: int, sch: ScheduleCfg, base_lr: float) -> float:
+    """LR at ``step``: the base cosine schedule, or the restart schedule once it has begun."""
+    start = sch.lr_restart_iteration
+    if start is None or step < start:
+        return cosine_lr(
+            step, sch.total_iterations, base_lr, sch.lr_final_ratio, sch.lr_decay_fraction
+        )
+    lo, hi = sch.lr_final_ratio, sch.lr_restart_peak_ratio
+    k = max(0, step - start - sch.warmup_iterations)
+    warm = max(1, sch.lr_restart_warmup_iterations)
+    if k < warm:
+        return base_lr * (lo + (hi - lo) * k / warm)
+    remaining = sch.total_iterations - start - sch.warmup_iterations - warm
+    decay_steps = max(1, int(remaining * sch.lr_decay_fraction))
+    x = min(k - warm, decay_steps) / decay_steps
+    return base_lr * (lo + (hi - lo) * 0.5 * (1.0 + math.cos(math.pi * x)))
 
 
 def build_models(
@@ -294,13 +319,7 @@ class SuperMimicRunner:
                 self._utd_acc += sch.updates_per_env_step
                 while self._utd_acc >= 1.0:
                     self._utd_acc -= 1.0
-                    lr = cosine_lr(
-                        self.iteration,
-                        sch.total_iterations,
-                        cfg.wm_trainer.lr,
-                        sch.lr_final_ratio,
-                        sch.lr_decay_fraction,
-                    )
+                    lr = scheduled_lr(self.iteration, sch, cfg.wm_trainer.lr)
                     self.wm_trainer.set_lr(lr)
                     self.policy_trainer.set_lr(lr * cfg.policy_trainer.lr / cfg.wm_trainer.lr)
                     t0 = time.perf_counter()
@@ -376,6 +395,7 @@ class SuperMimicRunner:
             f"train_ret {tr:.3f} (n={len(finished_returns)}) | "
             f"wm nse1 {agg.get('wm/nse_1step', float('nan')) / den:.4f} nse{self.cfg.wm_trainer.window} {(float(err[-1]) if err is not None else float('nan')):.4f} | "
             f"imag_ret {agg.get('policy/imag_return_undisc', float('nan')) / den:.3f} surv {agg.get('policy/imag_survival_H', float('nan')) / den:.3f} | "
+            f"lr {agg.get('lr', float('nan')):.2e} | "
             f"t sim/wm/pi {timers['sim']:.1f}/{timers['wm']:.1f}/{timers['policy']:.1f}s",
             flush=True,
         )

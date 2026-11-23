@@ -152,6 +152,26 @@ def test_gae_targets_reduce_to_discounted_return():
     np.testing.assert_allclose(out[:, 0].numpy(), [1.75, 1.5, 1.0])
 
 
+def test_lr_restart_schedule():
+    from unilab.algos.torch.supermimic.runner import ScheduleCfg, cosine_lr, scheduled_lr
+
+    base = ScheduleCfg(total_iterations=1000)
+    for it in (0, 400, 900):
+        assert scheduled_lr(it, base, 1.0) == cosine_lr(it, 1000, 1.0, 0.03, base.lr_decay_fraction)
+    sch = ScheduleCfg(
+        total_iterations=2000,
+        warmup_iterations=100,
+        lr_restart_iteration=1000,
+        lr_restart_peak_ratio=0.2,
+        lr_restart_warmup_iterations=200,
+    )
+    assert scheduled_lr(1000, sch, 1.0) == pytest.approx(0.03)  # data-only warmup keeps the floor
+    assert scheduled_lr(1100, sch, 1.0) == pytest.approx(0.03)
+    assert scheduled_lr(1200, sch, 1.0) == pytest.approx(0.115)  # halfway up the ramp
+    assert scheduled_lr(1300, sch, 1.0) == pytest.approx(0.2)  # peak
+    assert scheduled_lr(2000, sch, 1.0) == pytest.approx(0.03)  # decayed back to the floor
+
+
 def test_replay_windows_stay_inside_episodes():
     buf = ReplayBuffer(num_envs=1, capacity=32, state_dim=1, act_dim=1, xi_dim=1, device="cpu")
     ids = torch.tensor([0])
@@ -255,6 +275,19 @@ def test_env_matches_torch_heads(clips):
     np.testing.assert_allclose(
         s1[:, 7:36].numpy(), (s[:, 7:36] + 0.02 * s[:, 42:]).numpy(), atol=1e-6
     )
+
+
+def test_sampler_boost_keywords(clips):
+    env = _make_env(clips, sampler={"boost_keywords": ["clip1"], "boost_factor": 4.0})
+    sampler, lib = env.sampler, env.library
+    boosted = np.array(["clip1" in n for n in lib.clip_names])[lib.bin_clip]
+    assert boosted.any() and not boosted.all()
+    np.testing.assert_array_equal(sampler.bin_prior, np.where(boosted, 4.0, 1.0))
+    frames = sampler.sample(20000)
+    share = np.isin(lib.frame_clip[frames], np.flatnonzero(["clip1" in n for n in lib.clip_names]))
+    # all bins start with equal return-based mass, so the boosted share is 4 b / (4 b + (B - b))
+    b, nb = boosted.sum(), boosted.size
+    assert share.mean() == pytest.approx(4 * b / (4 * b + nb - b), abs=0.02)
 
 
 def test_clip_end_truncates(clips):

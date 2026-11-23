@@ -16,7 +16,7 @@ from __future__ import annotations
 import csv
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -225,6 +225,10 @@ class ReturnSamplerCfg:
     memory_alpha: float = 0.01
     min_remaining_steps: int = 100
     max_logged_steps: int = 1024
+    # Static prior on top of the return-based mixture ("return" mode only): bins of clips whose
+    # name contains any of ``boost_keywords`` get ``boost_factor`` times their probability.
+    boost_keywords: list[str] = field(default_factory=list)
+    boost_factor: float = 1.0
 
 
 class ReturnBasedSampler:
@@ -250,6 +254,16 @@ class ReturnBasedSampler:
         self.ep_len = np.zeros(num_envs, dtype=np.int64)
         self.gamma_pow = cfg.gamma ** np.arange(self.max_steps, dtype=np.float64)
         self.entropy = 1.0
+        self.bin_prior = np.ones(lib.num_bins, dtype=np.float64)
+        if cfg.boost_keywords and cfg.boost_factor != 1.0:
+            boosted = np.array(
+                [any(k in name for k in cfg.boost_keywords) for name in lib.clip_names]
+            )
+            self.bin_prior[boosted[lib.bin_clip]] = cfg.boost_factor
+            print(
+                f"[SuperMimic] sampler boost x{cfg.boost_factor} on {int(boosted.sum())} clips "
+                f"({int(boosted[lib.bin_clip].sum())} bins) matching {list(cfg.boost_keywords)}"
+            )
 
     def log_step(self, reward: np.ndarray, frame: np.ndarray) -> None:
         """Append every env's reward of this step and the bin of its target frame."""
@@ -305,7 +319,7 @@ class ReturnBasedSampler:
             cfg.uniform_ratio / lib.num_bins
             + cfg.hard_ratio * hard
             + cfg.memory_ratio * self.bin_memory / self.bin_memory.sum()
-        )
+        ) * self.bin_prior
         p /= p.sum()
         b = self.rng.choice(lib.num_bins, size=n, p=p)
         u = self.rng.random(n)

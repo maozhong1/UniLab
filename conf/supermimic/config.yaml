@@ -51,6 +51,9 @@ algo:
       log_interval: 50
       checkpoint_interval: 4000
       max_hours: null
+      lr_restart_iteration: null  # fine-tuning: LR warm restart from this iteration (see ScheduleCfg)
+      lr_restart_peak_ratio: 0.2
+      lr_restart_warmup_iterations: 2000
 
 training:
   task_name: H2SuperMimic
