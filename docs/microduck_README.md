@@ -167,12 +167,127 @@ setsid env HF_ENDPOINT=https://hf-mirror.com \
 HF_ENDPOINT=https://hf-mirror.com uv run --extra mujoco --extra microduck --no-sync \
   eval --algo ppo --task microduck_velocity_flat --sim mujoco \
   --load-run -1 --render-mode record \
-  training.device=xpu algo.num_envs=16 training.play_steps=1500
+  training.device=xpu training.play_steps=1500
 # → logs/rsl_rl_ppo/MicroduckVelocityFlat/<timestamp>_mujoco/play_video.mp4
 ```
 
+> The number of envs in an eval/record run is **`training.play_env_num`**
+> (microduck owner configs set 4; global default 16), not `algo.num_envs` (that
+> one only sizes training). Rendering is CPU-bound and competes with a running
+> training job for cores, so fewer envs / fewer frames render much faster.
+
 Resume a run with `--load-run <path> --checkpoint <N>`; use `--load-run -1` to pick
 the most recent run directory.
+
+---
+
+## 5. Roller skating (`MicroduckRollers`)
+
+The roller-skate stride task, ported from `microduck_rl`'s
+`microduck_velocity_rollers_env_cfg.py`. Same 61D obs / BAM actuator as the walk
+task, on the `scene_rollers_motor.xml` model (4 passive wheels, two per blade,
+interleaved after each ankle in qpos).
+
+- Code: `src/unilab/envs/locomotion/microduck/rollers.py`; owner config
+  `conf/ppo/task/microduck_rollers/mujoco.yaml`.
+- Command: `cmd_x ∈ (-0.5, 0.6)` (0 = coast, >0 = push, <0 = brake), 20% of samples
+  forced forward (`cmd_x ≥ 0.3`), resampled every 3–8 s; yaw / head / body slots
+  are zero. Spawn heading is random; `heading_hold` keeps the spawn heading.
+- The only positive task reward is `wheel_speed` (the wheels must actually spin);
+  `forward_lean` + `upright` (std √0.2) make it lean into the push, `pose` +
+  `neck_joint_pos` keep legs/head near HOME.
+- Reset matches the source: base z ~ U(0.1335, 0.1435) (the STAND keyframe z=0.12
+  sinks the tires ~2 cm into the floor) and zero base velocity.
+
+### 5.1 Training steps
+
+```bash
+cd ~/work/microduck/UniLab
+
+# 0) XPU torch still in place? (any `uv sync` / `uv run` without --no-sync
+#    silently swaps it for the CUDA build → "Torch not compiled with XPU enabled")
+uv run --no-sync python -c "import torch; print(torch.__version__, torch.xpu.is_available())"
+#    expect: 2.7.0+xpu True ; otherwise reinstall (plain install is a no-op, force it):
+uv pip install torch==2.7.0 --torch-backend xpu --reinstall-package torch
+
+# 1) tests (CPU)
+uv run --extra mujoco --extra microduck --no-sync pytest tests/envs/locomotion/microduck/ -q
+
+# 2) smoke test: 64 envs × 5 iterations
+HF_ENDPOINT=https://hf-mirror.com uv run --extra mujoco --extra microduck --no-sync \
+  train --algo ppo --task microduck_rollers --sim mujoco \
+  algo.num_envs=64 algo.max_iterations=5 training.device=xpu training.no_play=true
+
+# 3) full run, detached (4096 envs × 6000 iterations ≈ 5.5 h on XPU)
+setsid nohup env HF_ENDPOINT=https://hf-mirror.com uv run --extra mujoco --extra microduck --no-sync \
+  train --algo ppo --task microduck_rollers --sim mujoco \
+  algo.num_envs=4096 algo.max_iterations=6000 training.device=xpu training.no_play=true \
+  > train_rollers.log 2>&1 < /dev/null &
+```
+
+Monitor / stop:
+
+```bash
+tail -f train_rollers.log                       # per-iteration rewards + ETA
+ps -eo pid,pgid,args | grep "[t]rain --algo"     # find the process group
+kill -- -<PGID>                                  # stop the whole run
+# → logs/rsl_rl_ppo/MicroduckRollers/<timestamp>_mujoco/model_<N>.pt
+```
+
+What a healthy run looks like: mean episode length → ~950/1000 (no falls);
+`reward/wheel_speed`, `glide`, `single_support` positive and rising;
+`reward/forward_lean` clearly > 0 (the duck leans into the push);
+`reward/pose` > 0 and `reward/neck_joint_pos` → 0 (head stays forward); every
+penalty term ≤ 0.
+
+### 5.2 Video output
+
+**a) Stock eval / record** (also exports `policy.onnx`). The free camera sits at a
+world-fixed azimuth while each duck spawns with a random heading, so a duck may
+skate *toward* the camera.
+
+```bash
+# 4 ducks in a 2x2 grid, fixed camera close to the ducks
+HF_ENDPOINT=https://hf-mirror.com uv run --extra mujoco --extra microduck --no-sync \
+  eval --algo ppo --task microduck_rollers --sim mujoco \
+  --load-run -1 --render-mode record \
+  training.device=xpu training.play_env_num=4 training.play_steps=1000 \
+  training.render_spacing=0.4 training.cam_distance=1.0 \
+  'training.cam_lookat=[0.2,0.2,0.08]' training.cam_elevation=-25
+
+# 1 duck, camera tracking it, 768x480
+HF_ENDPOINT=https://hf-mirror.com uv run --extra mujoco --extra microduck --no-sync \
+  eval --algo ppo --task microduck_rollers --sim mujoco \
+  --load-run -1 --render-mode record \
+  training.device=xpu training.play_env_num=1 training.play_steps=800 \
+  training.cam_tracking=true training.cam_tracking_extra_envs=0 \
+  training.cam_distance=1.0 training.cam_elevation=-25 training.cam_azimuth=90 \
+  training.render_width=768 training.render_height=480
+# → logs/rsl_rl_ppo/MicroduckRollers/<timestamp>_mujoco/play_video.mp4
+```
+
+Camera knobs: `play_env_num` = ducks in the video; `cam_distance` smaller =
+bigger ducks; `cam_lookat=[x,y,z]` is the look-at point (default z=0.75 is sized
+for humanoids — use ~0.08 for the duck; x,y = grid centre = spacing/2 for 4 ducks);
+`cam_azimuth` is world-fixed. Width/height default to 1280x720 and should be
+multiples of 16 (otherwise the encoder pads, e.g. 760 → 768). Tracking mode
+renders serially: ~0.25 s/frame, so 1000 frames ≈ 5 min.
+
+**b) Chase-camera video** (`scripts/microduck_roller_chase_video.py`, a local
+helper): the camera stays **behind each duck's heading**, one tile per duck,
+with a fixed forward push by default.
+
+```bash
+uv run --extra mujoco --extra microduck --no-sync python scripts/microduck_roller_chase_video.py \
+  --ckpt logs/rsl_rl_ppo/MicroduckRollers/<timestamp>_mujoco/model_<N>.pt \
+  --num-envs 4 --steps 800 --cmd-x 0.5 --out roller_4ducks.mp4
+```
+
+Options: `--num-envs` (>1 tiles a grid), `--cmd-x` (push, (0, 0.6]),
+`--random-cmd` (use the env's own sampled/resampled commands: coast / push /
+brake), `--behind` (0 = behind, 90 = side, 180 = front), `--distance`,
+`--elevation`, `--width/--height` (full frame), `--steps`. Without `--ckpt` it
+picks the newest checkpoint of the newest rollers run.
 
 ---
 
@@ -183,7 +298,10 @@ the most recent run directory.
 | `src/unilab/envs/locomotion/microduck/base.py` | `MicroduckBaseEnv` — shared 61D obs / BAM wiring / DR / termination |
 | `src/unilab/envs/locomotion/microduck/actuator.py` | BAM XL330 voltage actuator adapter (per-step control callback) |
 | `src/unilab/envs/locomotion/microduck/velocity.py` | `MicroduckVelocityEnv` — the walking task + reward config |
+| `src/unilab/envs/locomotion/microduck/rollers.py` | `MicroduckRollersEnv` — roller-skate stride task + reward config |
 | `src/unilab/envs/locomotion/microduck/rewards.py` | microduck reward functions (tracking, foot-gait, duty-cycle) |
 | `src/unilab/assets/robots/microduck/` | MJCF models (walk / groundcontact / rollers) + scenes |
 | `scripts/microduck_make_motor_xml.py` | generate `*_motor.xml` (bakes friction into the MJCF) |
 | `conf/ppo/task/microduck_velocity_flat/mujoco.yaml` | Hydra owner config (env + reward + backend) |
+| `conf/ppo/task/microduck_rollers/mujoco.yaml` | Hydra owner config for the roller task |
+| `scripts/microduck_roller_chase_video.py` | chase-camera (behind-heading) video helper for rollers |
