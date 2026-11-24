@@ -9,6 +9,7 @@
 training:
   task_name: MicroduckRollers
   sim_backend: mujoco
+  play_env_num: 4          # eval/record envs (global default 16); fewer = faster video
 algo:
   num_envs: 4096
   num_steps_per_env: 24

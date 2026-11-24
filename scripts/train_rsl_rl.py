@@ -329,6 +329,8 @@ def play_rsl_rl(cfg: DictConfig, device: str) -> str | None:
                     "cam_tracking": getattr(cfg.training, "cam_tracking", False),
                     "cam_tracking_env_idx": getattr(cfg.training, "cam_tracking_env_idx", 0),
                     "cam_tracking_extra_envs": getattr(cfg.training, "cam_tracking_extra_envs", 2),
+                    "render_width": getattr(cfg.training, "render_width", 1280),
+                    "render_height": getattr(cfg.training, "render_height", 720),
                 },
                 on_plan=_log_plan,
                 extra_data_getter=(
