@@ -14,7 +14,6 @@
 | XPU 后台训练启动脚本（nohup） | `scripts/supermimic/train_h2_xpu_nohup.sh` |
 | 评测（checkpoint 或 ONNX）/ ONNX 导出 | `scripts/supermimic/{eval_benchmark,export_onnx}.py` |
 | 录制 rollout / 离屏渲染视频 | `scripts/supermimic/{record_rollout,render_rollout}.py` |
-| bf16 与 fp32 策略梯度对比检查 | `scripts/supermimic/check_bf16_grad.py` |
 | 测试 | `tests/algos/test_supermimic.py` |
 
 环境逐项复现了 SuperMimic 的 mjlab 环境：
@@ -29,26 +28,13 @@
 
 算法通过环境的 `sm_*` 属性读取 `s`、`xi`、实际执行的动作和目标帧。
 
-未移植的内容：
-
-- 参考实现的 commit `24b8b61`，即 robot-aware 可行性过滤和 `normalize_bin_return`；
-- 多 GPU；
-- `anchor_obs`。
-
 clip 只按名字过滤：`motion_exclude_keywords: [table, _box_]`。参考实现的 H2 过滤也只去掉了这类 clip。
 
 ## 运行
 
 ```bash
-# CPU 冒烟测试（只检查流程：32 个 env、20 个 clip、小网络）
-uv run scripts/train_supermimic.py task=h2_supermimic/mujoco_cpu_smoke
-
-# CUDA 全量训练（与参考 H2 命令一致：4096 env，policy batch 2048，5 万次迭代，每 3000 次存 ckpt）
-uv run scripts/train_supermimic.py training.device=cuda algo.supermimic.wm_trainer.compile=default \
-    algo.supermimic.policy_trainer.compile=default
-
 # Intel XPU（torch 2.7.0+xpu）：先执行一次 `make sync-xpu`，之后始终用 `uv run --no-sync`。
-# mujoco_xpu 配置：4096 env，MLP 矩阵乘用 bf16，开启 torch.compile，数据与超参同参考 H2 训练。
+# mujoco_xpu 配置：4096 env，batch 2048, MLP 矩阵乘用 bf16，开启 torch.compile，数据与超参同参考 H2 训练。
 uv run --no-sync scripts/train_supermimic.py task=h2_supermimic/mujoco_xpu
 
 # 评测（评测协议：无噪声、无 DR，摩擦 1，从每个 clip 的第一帧开始）。
@@ -60,7 +46,7 @@ uv run scripts/supermimic/eval_benchmark.py --checkpoint logs/supermimic/H2Super
 uv run scripts/supermimic/export_onnx.py --checkpoint logs/supermimic/H2SuperMimic/<run>/ckpt_latest.pt
 ```
 
-### 后台训练（SSH 断开后继续运行）
+### 后台训练
 
 启动脚本用 `setsid nohup` 让训练脱离终端会话，SSH 或 VSCode 断开、关闭终端都不影响训练。日志写到 `logs/supermimic/train_h2_xpu_<时间>.log`，PID 写到 `logs/supermimic/train_h2_xpu.pid`。
 
@@ -75,10 +61,8 @@ kill $(cat logs/supermimic/train_h2_xpu.pid)                            # 停止
 scripts/supermimic/train_h2_xpu_nohup.sh algo.resume=logs/supermimic/H2SuperMimic/<run>/ckpt_latest.pt  # 断点续训
 ```
 
-训练开始的前一分钟左右在做 `torch.compile` 编译，这段时间没有日志输出是正常的。
 
 ### 续训
-
 `algo.resume=<ckpt>` 会恢复世界模型、policy、critic 及它们的 Adam 状态，以及重置采样器的统计量和迭代计数。replay buffer 不保存，续训后从当前迭代开始重新装数据；前 `schedule.warmup_iterations` 次迭代（默认 40）只采数据、不更新。
 
 - **断点续训**（训练中途停了）：用同一个 task，加 `algo.resume=.../ckpt_latest.pt`（见上一节）。学习率继续按原来的 cosine 曲线走，曲线按绝对迭代次数计算。
@@ -93,17 +77,12 @@ scripts/supermimic/train_h2_xpu_nohup.sh task=h2_supermimic/mujoco_xpu_continue1
     algo.resume=logs/supermimic/H2SuperMimic/<run>/ckpt_0050000.pt
 ```
 
-runner 只在 `checkpoint_interval` 的整数倍时写 `ckpt_<迭代数>.pt`，训练结束时的状态只写到 `ckpt_latest.pt`（例如间隔 3000 时的第 50000 次）。`ckpt_latest.pt` 会被后续训练覆盖，所以要从它开始新的训练前，先复制一份为 `ckpt_0050000.pt`。
-
-续训相关参数（默认全部关闭，不影响普通训练）：
-
 | 参数 | 含义 |
 |---|---|
 | `algo.supermimic.schedule.lr_restart_iteration` | 学习率重启开始的迭代数（一般就是续训的起点） |
 | `algo.supermimic.schedule.lr_restart_peak_ratio` | 重启后的峰值，按基础学习率的比例 |
 | `algo.supermimic.schedule.lr_restart_warmup_iterations` | 线性升温的长度，从重启后第一次更新开始算 |
 | `algo.supermimic.schedule.warmup_iterations` | （重新）开始后只采数据的迭代数；续训时建议 1000 左右，避免世界模型在几乎空的 buffer 上训练 |
-| `env.sampler.boost_keywords`、`env.sampler.boost_factor` | 名字含关键词的 clip，其 bin 的重置概率乘以该系数（例如 `[dance]`、`3.0`） |
 
 控制台日志会打印当前学习率（`lr ...`）。学习率重启后的高位阶段，评测分数会先下降（峰值附近约 -0.02），学习率降下来后再回升。判断重启是否有效，要看学习率降下来之后的 checkpoint，不要看中途的。
 
@@ -114,7 +93,6 @@ runner 只在 `checkpoint_interval` 的整数倍时写 `ckpt_<迭代数>.pt`，�
 - 灰色实体是策略的实际动作，半透明蓝色是参考动作；
 - 左上角标注 clip 名、归一化回报和时间。
 
-渲染在 CPU 上进行（默认 `MUJOCO_GL=osmesa`；这台 XPU 机器上 EGL 无法初始化），不会和核显上的训练抢资源。
 
 ```bash
 NPZ=~/work/sonic_vla_infer/GR00T-WholeBodyControl-ov/gear_sonic_deploy/h2/npz_new   # 8 条展示用 clip
@@ -128,8 +106,6 @@ MUJOCO_GL=osmesa uv run --no-sync scripts/supermimic/render_rollout.py \
 渲染选项：`--seconds N`（每个 clip 只渲染前 N 秒）、`--clips <名字> ...`、`--distance`（默认 3.2）、`--azimuth`（140）、`--elevation`（-14）、`--width/--height`（1280x720）、`--fps`（25）、`--no-ghost`（不画参考动作）。
 
 参考动作按它在世界坐标中的位置绘制，所以机器人和蓝影之间的错位就是累积的全局漂移。
-
-两个策略左右并排对比（同一批 clip 分别渲染到两个目录后）：
 
 ```bash
 mkdir -p media/sbs; for f in media/a/*.mp4; do n=$(basename $f); ffmpeg -y -loglevel error -i media/a/$n -i media/b/$n \
@@ -148,12 +124,10 @@ mkdir -p media/sbs; for f in media/a/*.mp4; do n=$(basename $f); ffmpeg -y -logl
 - **原版 ONNX 跑通**：SuperMimic 训练出的 `h2_mimic_full.onnx` 不做任何修改，直接在 UniLab 环境中运行。
   - 从两个目录随机抽 100 个 clip：平均归一化回报 0.939，按步加权 0.898，0 次摔倒。
   - 这从端到端验证了 obs / goal 布局、动作映射、物理、奖励、终止和帧时序。
-  - 注意：这个 ONNX 来自一次更大规模的训练（5 万多个 clip，20 万次迭代），不是参考 README 里那次 5 万次迭代的结果。只能当作上限参考，不能当作 5 万次训练的对比基准。
 - **训练结果**（`mujoco_xpu`，bf16）：从过滤后的 5408 个 clip 中随机抽 400 个（种子 0，下表各行用同一批 clip；参考 README 的 400 个 clip 是另一次抽样）：
 
   | 策略 | 平均 | 按步加权 | 摔倒 |
   |---|---|---|---|
-  | 参考 README，5 万次迭代（CUDA，mjlab） | 0.894 | 0.869 | 2 |
   | UniLab XPU，5 万次迭代 | 0.885 | 0.868 | 0 |
   | UniLab XPU，续训到 10 万次（`mujoco_xpu_continue100k`） | **0.906** | **0.889** | 0 |
   | `h2_mimic_full.onnx`（5 万多个 clip，20 万次迭代；上限） | 0.939 | 0.922 | 0 |
@@ -167,7 +141,6 @@ mkdir -p media/sbs; for f in media/a/*.mp4; do n=$(basename $f); ffmpeg -y -logl
   - torch 奖励与环境奖励一致（8 项全部）；
   - npz 中的参考 body 状态与参考状态的 FK 结果一致；
   - 零初始化的世界模型等价于匀速外推一步。
-- **CPU 冒烟训练**：世界模型的 1 步和 8 步误差在下降，想象 rollout 的存活率在上升。
 - **仿真吞吐**（12 核笔记本 CPU，mujoco backend）：4096 env 每步 0.118 s，1024 env 每步 0.035 s。
   - 环境仿真的是只保留碰撞部分的场景（`strip_visual_meshes: true`）：去掉可视网格和天空盒，碰撞网格只保留凸包顶点。
   - 这样做的原因：摩擦 / COM 随机化会让 backend 给每个 env 复制一份模型，单份模型从 187 MB 降到了 2 MB。
@@ -177,10 +150,3 @@ mkdir -p media/sbs; for f in media/a/*.mp4; do n=$(basename $f); ffmpeg -y -logl
   - 5 万次迭代约 21 小时。MLP 矩阵乘改用 fp32 时约 0.39 it/s。
   - 系统内存占用约 24 GB / 30 GB（核显与 CPU 共享内存）。
   - 在相同 replay 数据上对比 MLP 矩阵乘的精度：bf16 与 fp32 的 WM 评测 nse1 为 0.0810 vs 0.0813，nse8 为 0.165 vs 0.164，bf16 快 2.7 倍。
-  - 前 300 次迭代的变化：
-
-    | 指标 | 起点 | 300 次迭代后 |
-    |---|---|---|
-    | WM nse1 | 0.49 | 0.10 |
-    | imag_ret | 0.09 | 0.43 |
-    | train_ret | 0.42 | 0.51 |
