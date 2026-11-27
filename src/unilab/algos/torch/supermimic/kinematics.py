@@ -83,6 +83,9 @@ class HumanoidKinematics:
             )
         assert links[0].joint_type == mujoco.mjtJoint.mjJNT_FREE and links[0].parent_index == -1
         self.links = links
+        # Plain Python flags for forward(): comparing against the pybind ``mjtJoint`` enum inside
+        # the loop makes ``torch.compile`` graph-break once per body.
+        self._is_hinge = [l.joint_type == mujoco.mjtJoint.mjJNT_HINGE for l in links]
 
         t = lambda a: torch.as_tensor(np.asarray(a), dtype=dtype, device=self.device)  # noqa: E731
         self.body_pos = t(model.body_pos[1:])  # (nb,3)
@@ -109,6 +112,40 @@ class HumanoidKinematics:
         self.hinge_dof_adr = torch.tensor(
             [links[i].dof_adr for i in self.hinge_body_idx], device=self.device
         )
+        self._build_levels()
+
+    def _build_levels(self) -> None:
+        """Group bodies by tree depth. Bodies of one depth are independent, so FK runs one batched
+        step per level (~8) instead of one per body (33): far fewer kernels, which is what bounds
+        the SuperMimic world-model / imagination updates on XPU."""
+        nb = self.nbody
+        depth = [0] * nb
+        for i in range(1, nb):
+            depth[i] = depth[self.links[i].parent_index] + 1
+        levels = [[i for i in range(1, nb) if depth[i] == d] for d in range(1, max(depth) + 1)]
+        order = [0] + [i for lv in levels for i in lv]  # body ids in storage order
+        slot = {b: k for k, b in enumerate(order)}  # body id -> storage slot
+        self._inv_order = torch.tensor([slot[b] for b in range(nb)], device=self.device)
+        dev = self.device
+        self._levels = []
+        for lv in levels:
+            idx = torch.tensor(lv, device=dev)
+            hinge = torch.tensor(
+                [float(self._is_hinge[i]) for i in lv], dtype=self.dtype, device=dev
+            )
+            self._levels.append(
+                dict(
+                    parent=torch.tensor([slot[self.links[i].parent_index] for i in lv], device=dev),
+                    body_pos=self.body_pos[idx],
+                    body_quat=self.body_quat[idx],
+                    jnt_pos=self.jnt_pos[idx],
+                    jnt_axis=self.jnt_axis[idx],
+                    qpos0=self.qpos0[idx],
+                    hinge=hinge,
+                    qadr=torch.tensor([max(self.links[i].qpos_adr, 0) for i in lv], device=dev),
+                    dadr=torch.tensor([max(self.links[i].dof_adr, 0) for i in lv], device=dev),
+                )
+            )
 
     def body_index(self, name: str) -> int:
         return self.body_names.index(name)
@@ -128,58 +165,48 @@ class HumanoidKinematics:
           dict with 'pos' (..., nb, 3), 'quat' (..., nb, 4) and, if qvel is given,
           'lin_vel' (..., nb, 3), 'ang_vel' (..., nb, 3) in world frame at the link origin.
         """
-        batch = qpos.shape[:-1]
-        nb = self.nbody
-        pos = [None] * nb
-        quat = [None] * nb
-        lin = [None] * nb
-        ang = [None] * nb
         compute_vel = qvel is not None
 
-        # Root (free joint).
-        root_pos = qpos[..., 0:3]
+        # Root (free joint) occupies storage slot 0; every level is appended after its parents.
         root_quat = quat_normalize(qpos[..., 3:7])
-        pos[0] = root_pos
-        quat[0] = root_quat
+        P_pos = qpos[..., 0:3].unsqueeze(-2)
+        P_quat = root_quat.unsqueeze(-2)
         if compute_vel:
-            lin[0] = qvel[..., 0:3]
-            ang[0] = quat_apply(root_quat, qvel[..., 3:6])  # body -> world
+            P_lin = qvel[..., 0:3].unsqueeze(-2)
+            P_ang = quat_apply(root_quat, qvel[..., 3:6]).unsqueeze(-2)
 
-        for i in range(1, nb):
-            l = self.links[i]
-            p = l.parent_index
-            pq = quat[p]
-            pp = pos[p]
-            # Body frame from parent frame (fixed offset).
-            b_pos = pp + quat_apply(pq, self.body_pos[i].expand(*batch, 3))
-            b_quat = quat_mul(pq, self.body_quat[i].expand(*batch, 4))
-            if l.joint_type == mujoco.mjtJoint.mjJNT_HINGE:
-                anchor = b_pos + quat_apply(b_quat, self.jnt_pos[i].expand(*batch, 3))
-                axis_w = quat_apply(b_quat, self.jnt_axis[i].expand(*batch, 3))
-                angle = qpos[..., l.qpos_adr] - self.qpos0[i]
-                q_loc = quat_from_angle_axis(angle, self.jnt_axis[i].expand(*batch, 3))
-                b_quat = quat_mul(b_quat, q_loc)
-                b_pos = anchor - quat_apply(b_quat, self.jnt_pos[i].expand(*batch, 3))
-                if compute_vel:
-                    qd = qvel[..., l.dof_adr].unsqueeze(-1)
-                    w_joint = axis_w * qd
-                    ang[i] = ang[p] + w_joint
-                    lin[i] = (
-                        lin[p]
-                        + torch.cross(ang[p], b_pos - pp, dim=-1)
-                        + torch.cross(w_joint, b_pos - anchor, dim=-1)
-                    )
-            else:  # fixed body
-                if compute_vel:
-                    ang[i] = ang[p]
-                    lin[i] = lin[p] + torch.cross(ang[p], b_pos - pp, dim=-1)
-            pos[i] = b_pos
-            quat[i] = b_quat
+        for lv in self._levels:
+            par = lv["parent"]
+            pq = P_quat.index_select(-2, par)
+            pp = P_pos.index_select(-2, par)
+            ex = lambda x: x.expand(*pq.shape[:-1], x.shape[-1])  # noqa: E731
+            b_pos = pp + quat_apply(pq, ex(lv["body_pos"]))
+            b_quat = quat_mul(pq, ex(lv["body_quat"]))
+            # Fixed bodies carry zero joint anchor / axis and zero angle, so the hinge formulas
+            # below reduce to the plain fixed-offset case for them.
+            anchor = b_pos + quat_apply(b_quat, ex(lv["jnt_pos"]))
+            axis_w = quat_apply(b_quat, ex(lv["jnt_axis"]))
+            angle = (qpos[..., lv["qadr"]] - lv["qpos0"]) * lv["hinge"]
+            b_quat = quat_mul(b_quat, quat_from_angle_axis(angle, ex(lv["jnt_axis"])))
+            b_pos = anchor - quat_apply(b_quat, ex(lv["jnt_pos"]))
+            if compute_vel:
+                p_ang = P_ang.index_select(-2, par)
+                w_joint = axis_w * (qvel[..., lv["dadr"]] * lv["hinge"]).unsqueeze(-1)
+                lin = (
+                    P_lin.index_select(-2, par)
+                    + torch.cross(p_ang, b_pos - pp, dim=-1)
+                    + torch.cross(w_joint, b_pos - anchor, dim=-1)
+                )
+                P_lin = torch.cat([P_lin, lin], dim=-2)
+                P_ang = torch.cat([P_ang, p_ang + w_joint], dim=-2)
+            P_pos = torch.cat([P_pos, b_pos], dim=-2)
+            P_quat = torch.cat([P_quat, b_quat], dim=-2)
 
-        out = {"pos": torch.stack(pos, dim=-2), "quat": torch.stack(quat, dim=-2)}
+        inv = self._inv_order
+        out = {"pos": P_pos.index_select(-2, inv), "quat": P_quat.index_select(-2, inv)}
         if compute_vel:
-            out["lin_vel"] = torch.stack(lin, dim=-2)
-            out["ang_vel"] = torch.stack(ang, dim=-2)
+            out["lin_vel"] = P_lin.index_select(-2, inv)
+            out["ang_vel"] = P_ang.index_select(-2, inv)
         return out
 
     __call__ = forward
