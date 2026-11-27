@@ -154,3 +154,49 @@ BONES-SEED H2 folders (1946 + 3515 clips, no overlap, 33 bodies in MuJoCo order,
   it). With fp32 MLP matmuls: ~0.39 it/s. bf16 versus
   fp32 MLP matmuls on identical replay data: WM eval nse1 0.0810 vs 0.0813, nse8 0.165 vs 0.164,
   2.7x faster. 
+
+### XPU throughput notes (Arc Pro B70, 8192 envs, bf16, Xeon w5-3435X)
+
+The updates are bound by CPU-side kernel launches (~25 us per Triton launch on XPU), not by GPU
+FLOPs: update time was flat from batch 1024 to 2048. Changes, measured on the same data
+(400 iterations, `mujoco_xpu`, 8192 envs): 0.84 it/s -> 1.70 it/s (sequential) -> 2.41 it/s
+(`pipeline`). With 4096 envs the optimized run reaches ~2.98 it/s (about 10 GB of VRAM).
+
+* `kinematics.py`: FK no longer compares the pybind `mjtJoint` enum inside the body loop (it made
+  `torch.compile` graph-break ~200 times per step) and runs one batched step per tree depth
+  instead of one per body.
+* `imagination.py`: policy forward, history update and sensor noise are compiled together with the
+  world-model step; goal windows, root-error features and survival are computed for all steps at
+  once. `runner.py` enables inductor `combo_kernels` on XPU (launches per step 574 -> 182).
+* `replay_buffer.py`: the window / start sampling mask is built once per buffer state instead of
+  once per batch (it scanned all 8192 x 1000 rows ten times per update).
+* `schedule.pipeline: true` (on in `mujoco_xpu`): updates run in a learner thread while the main
+  thread simulates, so the CPU simulation overlaps the GPU updates. Collection acts with a policy
+  at most `schedule.pipeline_lag` (1) updates old; the update-to-data ratio is unchanged. The
+  console `t sim/wm/pi` timers are then concurrent, not additive. Set `pipeline=false` to get the
+  strictly sequential loop back.
+
+### Platform comparison (Panther Lake iGPU, Arc Pro B70, RTX 5090)
+
+Batch 2048, UTD 0.4, H = 32 for all columns. Panther Lake is the unoptimized baseline; the B70 runs
+include the optimizations above. The 5090 column is the GR2 run from `GR2_TRAINING_README.md` of
+SuperMimic-Reproduced (mjlab / MuJoCo Warp, GPU simulation, 51.7 k clips); the two XPU columns run
+H2 with MuJoCo on the CPU and 5.4 k clips, so this is not a like-for-like comparison.
+
+| | Panther Lake iGPU | Arc Pro B70, 4096 envs | Arc Pro B70, 8192 envs | RTX 5090, 4096 envs |
+|---|---|---|---|---|
+| Simulation step | 0.15 s (12-core CPU) | 0.15 s (32-thread Xeon, overlapped) | 0.25 s (0.33 s overlapped) | on GPU, not split out |
+| World-model update | ~1.1 s | ~0.39 s | ~0.40 s (was ~0.50) | n/a |
+| Policy + critic update | ~2.1 s | ~0.44 s | ~0.45 s (was ~1.87) | n/a |
+| Throughput | 0.65-0.71 it/s | 2.98 it/s | 2.41 it/s (was 0.84) | ~4.4 it/s |
+| Env steps / s | ~2.8 k | ~12.2 k | ~19.7 k (was 6.9 k) | ~18.0 k |
+| 50k iterations | ~21 h | ~4.7 h | ~5.8 h | ~3.2 h |
+| Memory | ~24 of 30 GB (shared) | ~10 GB VRAM | ~12 GB VRAM (before opt.) | 17.7 GB VRAM |
+
+At 4096 envs the B70 is ~4.4x Panther Lake and ~68% of the 5090 in it/s; 8192 envs trade it/s for
+~60% more env steps/s. 50k-iteration times for the B70 and the 5090 are extrapolated from it/s (the
+5090 run took 14.8 h for 200k iterations).
+
+bf16 vs fp32 MLP matmuls (measured on Panther Lake, 4096 envs, same replay data): updates 2.7x faster and end-to-end
+~0.65-0.71 vs ~0.39 it/s (~1.7x), with no loss of accuracy (WM eval nse1 0.0810 vs 0.0813, nse8 0.165 vs 0.164; an fp32 fine-tune
+matched the bf16 results). The fp32 run was not repeated on the B70, so its bf16 gain there is not measured.
