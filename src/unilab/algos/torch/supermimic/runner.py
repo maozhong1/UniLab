@@ -160,6 +160,10 @@ class SuperMimicRunner:
         (self.log_dir / "supermimic_config.json").write_text(
             json.dumps({"algo": asdict(cfg), "env": asdict(env.cfg)}, indent=2, default=str)
         )
+        if self.device.type == "xpu" and (cfg.wm_trainer.compile or cfg.policy_trainer.compile):
+            # Horizontal fusion of independent small kernels: the compiled FK / reward graphs are
+            # launch-bound on XPU (~25 us per Triton launch), and this cuts the launch count ~3x.
+            torch._inductor.config.combo_kernels = True
         self.wm_trainer = WorldModelTrainer(self.wm, self.lib, cfg.wm_trainer)
         self.policy_trainer = PolicyTrainer(
             self.wm, self.policy, self.critic, self.lib, cfg.policy_trainer, env.cfg.obs_noise_half

@@ -99,9 +99,15 @@ class PolicyTrainer:
         self.wm, self.policy, self.critic, self.lib, self.cfg = wm, policy, critic, lib, cfg
         self.opt = torch.optim.Adam(policy.parameters(), lr=cfg.lr, betas=cfg.betas)
         self.critic_opt = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr)
-        self.step_fn = ImagStep(wm, lib.default_joint_pos, compile_mode=cfg.compile)
         nj = lib.default_joint_pos.numel()
         self.noise_half = obs_noise_half(nj, obs_noise).to(lib.device) if cfg.obs_noise else None
+        self.step_fn = ImagStep(
+            wm,
+            lib.default_joint_pos,
+            compile_mode=cfg.compile,
+            policy=policy,
+            noise_half=self.noise_half,
+        )
 
     def set_lr(self, lr: float) -> None:
         # The critic follows the policy schedule (as in the reference implementation).
