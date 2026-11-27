@@ -20,6 +20,7 @@ algo:
     schedule:
       total_iterations: 50000
       checkpoint_interval: 3000
+      pipeline: true
 
 env:
   motion_dirs:

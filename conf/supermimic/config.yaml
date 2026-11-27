@@ -54,6 +54,8 @@ algo:
       lr_restart_iteration: null  # fine-tuning: LR warm restart from this iteration (see ScheduleCfg)
       lr_restart_peak_ratio: 0.2
       lr_restart_warmup_iterations: 2000
+      pipeline: false  # learner thread overlaps GPU updates with CPU simulation
+      pipeline_lag: 1  # max updates the collector may run ahead of the learner
 
 training:
   task_name: H2SuperMimic

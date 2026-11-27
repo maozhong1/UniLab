@@ -7,8 +7,10 @@ critic live on the learner device.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -45,6 +47,11 @@ class ScheduleCfg:
     lr_restart_iteration: int | None = None
     lr_restart_peak_ratio: float = 0.2
     lr_restart_warmup_iterations: int = 2000
+    # Run the updates in a learner thread while the main thread simulates the next env steps (CPU
+    # sim and GPU updates otherwise run strictly one after the other). Collection acts with a
+    # policy at most ``pipeline_lag`` updates old; the update-to-data ratio is unchanged.
+    pipeline: bool = False
+    pipeline_lag: int = 1
 
 
 @dataclass
@@ -153,6 +160,10 @@ class SuperMimicRunner:
         self.env, self.cfg = env, cfg
         self.device = torch.device(device)
         torch.manual_seed(cfg.seed)
+        if self.device.type == "xpu" and (cfg.wm_trainer.compile or cfg.policy_trainer.compile):
+            # Horizontal fusion of independent small kernels: the compiled FK / reward graphs are
+            # launch-bound on XPU (~25 us per Triton launch), and this cuts the launch count ~3x.
+            torch._inductor.config.combo_kernels = True
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(str(self.log_dir))
@@ -160,10 +171,6 @@ class SuperMimicRunner:
         (self.log_dir / "supermimic_config.json").write_text(
             json.dumps({"algo": asdict(cfg), "env": asdict(env.cfg)}, indent=2, default=str)
         )
-        if self.device.type == "xpu" and (cfg.wm_trainer.compile or cfg.policy_trainer.compile):
-            # Horizontal fusion of independent small kernels: the compiled FK / reward graphs are
-            # launch-bound on XPU (~25 us per Triton launch), and this cuts the launch count ~3x.
-            torch._inductor.config.combo_kernels = True
         self.wm_trainer = WorldModelTrainer(self.wm, self.lib, cfg.wm_trainer)
         self.policy_trainer = PolicyTrainer(
             self.wm, self.policy, self.critic, self.lib, cfg.policy_trainer, env.cfg.obs_noise_half
@@ -186,8 +193,22 @@ class SuperMimicRunner:
         self.start_iteration = 0
         self.num_updates = 0
         self._utd_acc = 0.0
+        # Acting copy of the policy (the learner updates ``self.policy`` in place).
+        self.actor = copy.deepcopy(self.policy).requires_grad_(False)
+        self._actor_lock = threading.Lock()
+        self._learner_lock = threading.RLock()  # held for the duration of one update
+        self._cv = threading.Condition()  # guards num_updates / target / stop / error
+        self._stat_lock = threading.Lock()  # guards the aggregated metrics and timers
+        self._agg: dict[str, float] = {}
+        self._agg_n = 0
+        self._timers = {"sim": 0.0, "wm": 0.0, "policy": 0.0}
+        self._stop = False
+        self._err: BaseException | None = None
+        self._target_updates = 0
+        self._cur_iter = 0
         if resume is not None:
             self.load(resume)
+        self._sync_actor()
 
     # ------------------------------------------------------------------ checkpoints
 
@@ -234,14 +255,92 @@ class SuperMimicRunner:
     def _t(self, x: np.ndarray, dtype=torch.float32) -> torch.Tensor:
         return torch.as_tensor(np.ascontiguousarray(x), device=self.device).to(dtype)
 
+    def _sync_actor(self) -> None:
+        with self._actor_lock:
+            self.actor.load_state_dict(self.policy.state_dict())
+
     @torch.no_grad()
     def act(self, obs: dict[str, np.ndarray]) -> torch.Tensor:
-        return self.policy(self._t(obs["obs"]), self._t(obs["goal"]))
+        o, g = self._t(obs["obs"]), self._t(obs["goal"])
+        with self._actor_lock:
+            return self.actor(o, g)
+
+    # ------------------------------------------------------------------ updates
+
+    def _do_update(self, it: int) -> None:
+        """One world-model fit + policy improvement at the LR scheduled for iteration ``it``."""
+        cfg, sch = self.cfg, self.cfg.schedule
+        lr = scheduled_lr(it, sch, cfg.wm_trainer.lr)
+        self.wm_trainer.set_lr(lr)
+        self.policy_trainer.set_lr(lr * cfg.policy_trainer.lr / cfg.wm_trainer.lr)
+        t0 = time.perf_counter()
+        m_wm = self.wm_trainer.update(self.buffer)
+        _sync(self.device)
+        t_wm = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        for _ in range(sch.policy_updates_per_wm_update):
+            m_pi = self.policy_trainer.update(self.buffer)
+        _sync(self.device)
+        t_pi = time.perf_counter() - t0
+        self._sync_actor()
+        with self._stat_lock:
+            self._timers["wm"] += t_wm
+            self._timers["policy"] += t_pi
+            for k, v in m_wm.items():
+                self._agg[f"wm/{k}"] = self._agg.get(f"wm/{k}", 0.0) + v
+            for k, v in m_pi.items():
+                self._agg[f"policy/{k}"] = self._agg.get(f"policy/{k}", 0.0) + v
+            self._agg["lr"] = lr
+            self._agg_n += 1
+        with self._cv:
+            self.num_updates += 1
+            self._cv.notify_all()
+
+    def _learner_loop(self) -> None:
+        try:
+            while True:
+                with self._cv:
+                    self._cv.wait_for(lambda: self._stop or self.num_updates < self._target_updates)
+                    if self._stop:
+                        return
+                    it = self._cur_iter
+                with self._learner_lock:
+                    self._do_update(it)
+        except BaseException as e:  # surfaced in the main thread
+            self._err = e
+        finally:
+            with self._cv:
+                self._cv.notify_all()
 
     # ------------------------------------------------------------------ main loop
 
     def run(self) -> None:
-        cfg, sch, env = self.cfg, self.cfg.schedule, self.env
+        sch = self.cfg.schedule
+        learner = None
+        if sch.pipeline:
+            self._target_updates = self.num_updates
+            learner = threading.Thread(target=self._learner_loop, name="sm-learner", daemon=True)
+            learner.start()
+        try:
+            self._run(learner is not None)
+            if learner is not None:  # drain the updates still owed before the final checkpoint
+                with self._cv:
+                    self._cv.wait_for(
+                        lambda: self._err is not None or self.num_updates >= self._target_updates
+                    )
+        finally:
+            with self._cv:
+                self._stop = True
+                self._cv.notify_all()
+            if learner is not None:
+                learner.join()
+        if self._err is not None:
+            raise self._err
+        self.save("ckpt_latest.pt")
+        self.writer.flush()
+
+    def _run(self, pipelined: bool) -> None:
+        sch, env = self.cfg.schedule, self.env
         n = env.num_envs
         state = env.init_state()
         all_ids = torch.arange(n, device=self.device)
@@ -251,9 +350,6 @@ class SuperMimicRunner:
         ep_start = torch.ones(n, dtype=torch.bool, device=self.device)
         ep_reward = np.zeros(n)
         ep_len = np.zeros(n)
-        timers = {"sim": 0.0, "wm": 0.0, "policy": 0.0}
-        agg: dict[str, float] = {}
-        agg_n = 0
         finished_returns: list[float] = []
         finished_lens: list[float] = []
         t_start = last_log = time.time()
@@ -289,20 +385,21 @@ class SuperMimicRunner:
                 m = len(ids_np)
                 zeros_a = torch.zeros(m, env.num_joints, device=self.device)
                 term_frame = self._t(env.sm_frame_pre_reset[ids_np], torch.long)
-                self.buffer.add(
-                    ids,
-                    s=self._t(env.sm_state_pre_reset[ids_np]),
-                    a=zeros_a,
-                    a_exec=zeros_a,
-                    xi=prev_xi[ids],
-                    r=torch.zeros(m, device=self.device),
-                    done=self._t(term[ids_np]),
-                    frame=term_frame,
-                    clip=self.lib.frame_clip[term_frame],
-                    terminal=torch.ones(m, dtype=torch.bool, device=self.device),
-                    ep_start=torch.zeros(m, dtype=torch.bool, device=self.device),
-                )
-                self.buffer.end_episode(ids)
+                with self.buffer.lock:  # terminal rows and the episode counter move together
+                    self.buffer.add(
+                        ids,
+                        s=self._t(env.sm_state_pre_reset[ids_np]),
+                        a=zeros_a,
+                        a_exec=zeros_a,
+                        xi=prev_xi[ids],
+                        r=torch.zeros(m, device=self.device),
+                        done=self._t(term[ids_np]),
+                        frame=term_frame,
+                        clip=self.lib.frame_clip[term_frame],
+                        terminal=torch.ones(m, dtype=torch.bool, device=self.device),
+                        ep_start=torch.zeros(m, dtype=torch.bool, device=self.device),
+                    )
+                    self.buffer.end_episode(ids)
                 finished_returns.extend(
                     (
                         ep_reward[ids_np] / (self.max_step_reward * np.maximum(ep_len[ids_np], 1))
@@ -315,36 +412,41 @@ class SuperMimicRunner:
             prev_xi = self._t(env.sm_xi())
             prev_frame = self._t(env.frame, torch.long)
             ep_start = self._t(done, torch.bool)
-            timers["sim"] += time.perf_counter() - t0
+            with self._stat_lock:
+                self._timers["sim"] += time.perf_counter() - t0
             self.iteration += 1
 
             # ---------------- (2)+(3) updates at the configured update-to-data ratio
             if self.iteration - self.start_iteration >= sch.warmup_iterations:
                 self._utd_acc += sch.updates_per_env_step
-                while self._utd_acc >= 1.0:
-                    self._utd_acc -= 1.0
-                    lr = scheduled_lr(self.iteration, sch, cfg.wm_trainer.lr)
-                    self.wm_trainer.set_lr(lr)
-                    self.policy_trainer.set_lr(lr * cfg.policy_trainer.lr / cfg.wm_trainer.lr)
-                    t0 = time.perf_counter()
-                    m_wm = self.wm_trainer.update(self.buffer)
-                    _sync(self.device)
-                    timers["wm"] += time.perf_counter() - t0
-                    t0 = time.perf_counter()
-                    for _ in range(sch.policy_updates_per_wm_update):
-                        m_pi = self.policy_trainer.update(self.buffer)
-                    _sync(self.device)
-                    timers["policy"] += time.perf_counter() - t0
-                    self.num_updates += 1
-                    for k, v in m_wm.items():
-                        agg[f"wm/{k}"] = agg.get(f"wm/{k}", 0.0) + v
-                    for k, v in m_pi.items():
-                        agg[f"policy/{k}"] = agg.get(f"policy/{k}", 0.0) + v
-                    agg["lr"] = lr
-                    agg_n += 1
+                due = int(self._utd_acc)
+                self._utd_acc -= due
+                if pipelined:
+                    with self._cv:
+                        self._target_updates += due
+                        self._cur_iter = self.iteration
+                        self._cv.notify_all()
+                else:
+                    for _ in range(due):
+                        self._do_update(self.iteration)
+            if pipelined:
+                # Back-pressure: collection may run at most ``pipeline_lag`` updates ahead.
+                with self._cv:
+                    self._cv.wait_for(
+                        lambda: (
+                            self._err is not None
+                            or self.num_updates >= self._target_updates - sch.pipeline_lag
+                        )
+                    )
+                if self._err is not None:
+                    return
 
             # ---------------- logging / checkpoints
             if self.iteration % sch.log_interval == 0:
+                with self._stat_lock:
+                    agg, agg_n, timers = self._agg, self._agg_n, dict(self._timers)
+                    self._agg, self._agg_n = {}, 0
+                    self._timers = {k: 0.0 for k in self._timers}
                 self._log(
                     agg,
                     agg_n,
@@ -356,17 +458,16 @@ class SuperMimicRunner:
                     state.info.get("log"),
                 )
                 last_log = time.time()
-                agg, agg_n = {}, 0
                 finished_returns, finished_lens = [], []
-                timers = {k: 0.0 for k in timers}
             if self.iteration % sch.checkpoint_interval == 0:
-                self.save("ckpt_latest.pt")
-                self.save(f"ckpt_{self.iteration:07d}.pt")
+                with (
+                    self._learner_lock
+                ):  # no update in flight: consistent weights / optimiser state
+                    self.save("ckpt_latest.pt")
+                    self.save(f"ckpt_{self.iteration:07d}.pt")
             if sch.max_hours is not None and (time.time() - t_start) / 3600 > sch.max_hours:
                 print("[SuperMimic] max_hours reached, stopping")
                 break
-        self.save("ckpt_latest.pt")
-        self.writer.flush()
 
     def _log(
         self, agg, agg_n, finished_returns, finished_lens, timers, t_start, last_log, env_log
@@ -382,7 +483,10 @@ class SuperMimicRunner:
             w.add_scalar("train/episode_len", float(np.mean(finished_lens)), it)
         err = None
         if self.buffer.size > 2048:
-            err = self.wm_trainer.online_error(self.buffer, n=1024, k=self.cfg.wm_trainer.window)
+            with self._learner_lock:
+                err = self.wm_trainer.online_error(
+                    self.buffer, n=1024, k=self.cfg.wm_trainer.window
+                )
             w.add_scalar("wm/online_nse_1step", float(err[0]), it)
             w.add_scalar("wm/online_nse_kstep", float(err[-1]), it)
         for k, v in timers.items():
