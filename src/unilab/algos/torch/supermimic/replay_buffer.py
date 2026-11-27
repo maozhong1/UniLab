@@ -10,6 +10,7 @@ can use it as their last target state and the termination head gets positive lab
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 
 import torch
@@ -62,11 +63,17 @@ class ReplayBuffer:
         self.ep_counter = torch.zeros(E, dtype=torch.long, device=self.device)
         self.total_rows = 0
         self._env_ar = torch.arange(E, device=self.device)
+        # Sampling distributions depend only on the buffer content, which changes in add() /
+        # end_episode(); an update draws many batches from an unchanged buffer.
+        self._probs_cache: dict = {}
+        # The collector appends while the learner thread samples (runner pipelines them).
+        self.lock = threading.RLock()
 
     # ------------------------------------------------------------------ writes
 
     @torch.no_grad()
-    def add(self, env_ids, s, a, a_exec, xi, r, done, frame, clip, terminal, ep_start) -> None:
+    def _add(self, env_ids, s, a, a_exec, xi, r, done, frame, clip, terminal, ep_start) -> None:
+        self._probs_cache.clear()
         p = self.ptr[env_ids]
         self.s[env_ids, p] = s
         self.a[env_ids, p] = a
@@ -84,12 +91,14 @@ class ReplayBuffer:
         self.total_rows += int(env_ids.numel())
 
     @torch.no_grad()
-    def end_episode(self, env_ids) -> None:
+    def _end_episode(self, env_ids) -> None:
+        self._probs_cache.clear()
         self.ep_counter[env_ids] += 1
 
     @property
     def size(self) -> int:
-        return int(self.valid.sum().item())
+        with self.lock:
+            return int(self.valid.sum().item())
 
     # ------------------------------------------------------------------ sampling helpers
 
@@ -116,17 +125,19 @@ class ReplayBuffer:
         return ok
 
     @torch.no_grad()
-    def _sample_from_mask(self, mask: torch.Tensor, n: int) -> tuple[torch.Tensor, torch.Tensor]:
-        flat = mask.reshape(-1)
-        total = int(flat.sum().item())
-        if total == 0:
-            raise RuntimeError("replay buffer has no sampleable rows yet")
-        idx = torch.multinomial(flat.float(), n, replacement=True)
+    def _sample_from_mask(self, key, build_mask, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+        probs = self._probs_cache.get(key)
+        if probs is None:
+            probs = build_mask().reshape(-1).float()
+            if int(probs.sum().item()) == 0:
+                raise RuntimeError("replay buffer has no sampleable rows yet")
+            self._probs_cache[key] = probs
+        idx = torch.multinomial(probs, n, replacement=True)
         return idx // self.T, idx % self.T
 
     @torch.no_grad()
-    def sample_windows(self, n: int, k: int) -> WindowBatch:
-        e, t = self._sample_from_mask(self.window_mask(k), n)
+    def _sample_windows(self, n: int, k: int) -> WindowBatch:
+        e, t = self._sample_from_mask(("w", k), lambda: self.window_mask(k), n)
         offs = torch.arange(k + 1, device=self.device)
         tt = (t[None, :] + offs[:, None]) % self.T  # (k+1, n)
         ee = e[None, :].expand(k + 1, n)
@@ -141,14 +152,16 @@ class ReplayBuffer:
         )
 
     @torch.no_grad()
-    def sample_starts(self, n: int, hist: int) -> StartBatch:
-        mask = self.valid & ~self.terminal
-        t_idx = torch.arange(self.T, device=self.device)[None, :]
-        dist_to_ptr = (self.ptr[:, None] - t_idx - 1) % self.T
-        mask &= (
-            dist_to_ptr < self.T - hist - 1
-        )  # keep history rows from being overwritten underneath
-        e, t = self._sample_from_mask(mask, n)
+    def _sample_starts(self, n: int, hist: int) -> StartBatch:
+
+        def start_mask() -> torch.Tensor:
+            mask = self.valid & ~self.terminal
+            t_idx = torch.arange(self.T, device=self.device)[None, :]
+            dist_to_ptr = (self.ptr[:, None] - t_idx - 1) % self.T
+            # keep history rows from being overwritten underneath
+            return mask & (dist_to_ptr < self.T - hist - 1)
+
+        e, t = self._sample_from_mask(("s", hist), start_mask, n)
         offs = torch.arange(hist, device=self.device) - (hist - 1)  # -(hist-1) .. 0
         tt = (t[None, :] + offs[:, None]) % self.T  # (hist, n)
         ee = e[None, :].expand(hist, n)
@@ -181,3 +194,19 @@ class ReplayBuffer:
             hist_states=hist_states,
             hist_actions=hist_actions,
         )
+
+    def add(self, *args, **kwargs) -> None:
+        with self.lock:
+            self._add(*args, **kwargs)
+
+    def end_episode(self, env_ids) -> None:
+        with self.lock:
+            self._end_episode(env_ids)
+
+    def sample_windows(self, n: int, k: int) -> WindowBatch:
+        with self.lock:
+            return self._sample_windows(n, k)
+
+    def sample_starts(self, n: int, hist: int) -> StartBatch:
+        with self.lock:
+            return self._sample_starts(n, hist)
