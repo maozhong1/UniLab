@@ -1,0 +1,27 @@
+# @package _global_
+# H2 SuperMimic full-dataset run on an Intel XPU (same setup as h2_supermimic/mujoco_xpu):
+# 60k+ retargeted npz in ~/work/h2_g1_retarget/npz, 250k iterations.
+training:
+  task_name: H2SuperMimic
+  sim_backend: mujoco
+  device: xpu
+
+algo:
+  num_envs: 4096
+  supermimic:
+    mlp_dtype: bfloat16
+    wm_trainer:
+      compile: default
+    policy_trainer:
+      batch_size: 2048
+      compile: default
+    schedule:
+      total_iterations: 250000
+      checkpoint_interval: 10000
+      pipeline: true
+
+env:
+  motion_dirs:
+    - ~/work/h2_g1_retarget/npz
+  motion_exclude_keywords: [table, _box_]
+  sampling_mode: return
